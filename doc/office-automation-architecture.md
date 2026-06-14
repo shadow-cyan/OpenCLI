@@ -1,15 +1,15 @@
 # 办公自动化平台架构设计
 
-> 基于 waiy-browser-use + OpenCLI + Claude Code（主 Agent）的企业办公自动化方案。
+> 基于 waiy-browser-use + OpenCLI + 主 Agent（OpenClaw）的企业办公自动化方案。
 
 ---
 
 ## 一、先说结论
 
-1. **OpenCLI 已经能用**。154 个站点适配器，PUBLIC 策略的 CLI 实测 0.4-1.3 秒返回结构化数据，`validate` 校验 0.35 秒。
-2. **explore / generate 不是内置命令**，它们是 AI Agent 的工作流（skill），本质是"用 Agent 驱动 `opencli browser *` 原语完成 API 发现和适配器编写"。
-3. **Claude Code 可以直接作为主 Agent**。以 Skill 形式提供给客户，客户在 Claude Code 中调用。
-4. **一个客户的接入，核心工作量在 CLI 生成和验证**，巡检和推送是自动化的。
+1. **OpenCLI 已经能用**。154 个站点适配器，PUBLIC 策略的 CLI 本地实测 0.2-0.6 秒、沙箱环境 0.4-1.3 秒返回结构化数据。
+2. **explore / generate 不是内置命令**（v1.6.9 README 里的 `opencli generate` 从未实现过），它们是 AI Agent 的工作流（skill），本质是"用 Agent 驱动 `opencli browser *` 原语完成 API 发现和适配器编写"。这是第一个真正能端到端跑通的"生成器"。
+3. **主 Agent（OpenClaw）直接作为调度中心**，以 Skill 形式交付给客户。
+4. **整个流程分"录制"和"回放"两个阶段**：录制 = 研发用主 Agent 生成 CLI 适配器（一次性）；回放 = 客户日常调用已有 CLI 执行办公任务（重复）。巡检和推送是自动化的。
 
 ---
 
@@ -55,7 +55,7 @@ $ opencli npm search react -f json --limit 3
 它们**不是 OpenCLI 的内置命令**，而是 AI Agent 的工作流——具体在 `skills/opencli-adapter-author/SKILL.md` 中定义。流程如下：
 
 ```
-AI Agent（如 Claude Code）
+主 Agent（OpenClaw）
     │
     ├── 1. 用 opencli browser open <url> 打开目标网页
     ├── 2. 用 opencli browser network capture-start 开始抓包
@@ -69,7 +69,7 @@ AI Agent（如 Claude Code）
 
 所以 **explore/generate 的本质是 Agent 操作 OpenCLI 的一系列原语**。PDF 文档里写的 `opencli explore <url>` 和 `opencli generate <url>` 是对这个工作流的封装，实际底层调用的还是 `opencli browser *` 命令族。
 
-这意味着：**生成 CLI 适配器必须有 AI Agent 参与**（Claude Code 或类似）。这不是跑一个命令就完事的。
+这意味着：**生成 CLI 适配器必须有 AI Agent 参与**（OpenClaw 或类似）。这不是跑一个命令就完事的。
 
 ### 2.2 五级认证策略
 
@@ -85,22 +85,91 @@ AI Agent（如 Claude Code）
 
 **客户的 OA/ERP/钉钉/企微**，绝大多数走 COOKIE 或 HEADER 策略。因为这些系统的前端操作背后都有 JSON API，只需要登录态。
 
+### 2.3 录制 vs 回放——两个独立阶段
+
+整个办公自动化分两个完全不同的阶段：
+
+| | 录制（生成适配器） | 回放（执行办公任务） |
+|---|---|---|
+| **谁操作** | 我方研发 + 主 Agent（AI 驱动） | 客户的主 Agent（自动执行） |
+| **频率** | 一次性（每个 API 做一次） | 反复执行（每天/每周） |
+| **用的 Skill** | `opencli-adapter-author`（内部研发用） | 客户的 `office-automation`（我们交付的） |
+| **核心操作** | `opencli browser analyze/network/init/verify` | `opencli <site> <command>`（直接调用已有适配器） |
+| **需要浏览器** | 需要（侦察 + 验证） | 看 strategy：PUBLIC 不需要，COOKIE/UI 需要 |
+| **产出** | `clis/<site>/<name>.js` 适配器文件 | 结构化数据（JSON/表格） |
+| **耗时** | 30 分钟-2 小时/个 API | 0.5-10 秒/次执行 |
+
+**打个比方**：录制就像铺铁轨，回放就像跑火车。铺一次轨，火车跑无数趟。
+
+### 2.4 `opencli browser click` vs waiy-browser-use——有什么区别
+
+两者都能"点击网页元素"，但层次完全不同：
+
+| | `opencli browser click` | waiy-browser-use |
+|---|---|---|
+| **定位** | 浏览器操作原语（底层命令） | AI 浏览器驱动引擎（高层循环） |
+| **谁决定点哪里** | 人或 Agent 显式指定 selector | AI 看截图/DOM 自己判断 |
+| **确定性** | 完全确定（给什么 selector 点什么） | 不确定（AI 每次可能判断不同） |
+| **速度** | <1s（直接 CDP 调用） | 5-15s/步（需要截图 + LLM 推理） |
+| **用在哪** | **录制阶段**——Agent 侦察、调试、验证 | **回放降级**——没有 CLI 时兜底操作 |
+
+关键区分：`opencli browser click` 用在**录制阶段**，是 Agent 手里的工具，帮它一步步探索网站、抓取 API、验证适配器。录制完成后，生成的适配器代码里用的是直接 `fetch` API（不再需要点击操作）。只有 UI 策略的适配器才会在回放时操作 DOM，但那也是用确定性的 `page.click(selector)`，不是 AI 驱动。
+
+waiy-browser-use 用在**回放阶段的降级路径**——当客户说了一个没有 CLI 覆盖的操作时，让 AI 自主操作网页完成任务。
+
+### 2.5 涉及哪些 Skill
+
+项目里有 7 个 Skill，按角色分：
+
+**录制阶段用的（内部研发）：**
+
+| Skill | 做什么 | 什么时候用 |
+|---|---|---|
+| `opencli-adapter-author` | **主力**。完整的适配器生成决策树 + runbook | 给新站点写 CLI 时 |
+| `opencli-browser` | 浏览器操作手册（`state/find/click/type/network` 等全部子命令的用法） | adapter-author 过程中驱动浏览器 |
+| `opencli-autofix` | 自动修复失效适配器（诊断 → 探查 → patch → 重试，最多 3 轮） | 巡检发现 CLI 挂了时 |
+| `opencli-sitemap-author` | 站点地图编写（记录页面结构和导航路径） | 复杂站点需要先摸清页面结构时 |
+| `opencli-browser-sitemap` | 站点地图消费（读取已有 sitemap 加速侦察） | 有 sitemap 的站点，跳过重复探索 |
+| `opencli-usage` | 入门指南（命令总览、策略说明、路由表） | 不知道用什么命令时查 |
+
+**回放阶段用的（交付给客户）：**
+
+| Skill | 做什么 |
+|---|---|
+| `office-automation`（我们编写交付） | 告诉 OpenClaw 有哪些 opencli 命令可用、怎么调、什么时候降级到 waiy-browser-use |
+
+**注意**：客户不需要接触上面 6 个内部 Skill。客户只看到一个 `office-automation` skill，里面列出了所有可用的 CLI 命令和使用规则。
+
 ---
 
 ## 三、实测数据
 
-在沙箱环境中对 OpenCLI 的 PUBLIC 策略 CLI 进行了实测：
+### 3.1 沙箱环境实测（4C8G / 5Mbps 带宽）
 
-| 测试项 | 命令 | 耗时 | 结果 |
-|--------|------|------|------|
-| npm 搜索 | `opencli npm search react --limit 3` | **0.60s** | ✅ 3 条结构化结果 |
-| npm 包信息 | `opencli npm package lodash` | **0.43s** | ✅ 元数据完整 |
-| PyPI 包信息 | `opencli pypi package requests` | **0.46s** | ✅ 元数据完整 |
-| crates 搜索 | `opencli crates search serde --limit 2` | **1.29s** | ✅ 2 条结果 |
-| 适配器校验 | `opencli validate npm` | **0.35s** | ✅ 3 命令全通过 |
-| 适配器校验 | `opencli validate pypi` | **0.35s** | ✅ 2 命令全通过 |
+在云端沙箱环境（4C8G Ubuntu，5Mbps 出口带宽）中对 PUBLIC 策略 CLI 进行了实测：
 
-**结论**：PUBLIC 策略 CLI 的执行稳定在 **0.4-1.3 秒**。COOKIE 策略因为需要启动浏览器，预计 **5-10 秒**。相比 waiy-browser-use 的 **15-60 秒**（每步需要截图 + LLM 推理），OpenCLI 快一个数量级。
+| 测试项 | 命令 | 沙箱耗时 | 本地推算* | 结果 |
+|--------|------|----------|----------|------|
+| npm 搜索 | `opencli npm search react --limit 3` | **0.60s** | ~0.25s | ✅ 3 条结构化结果 |
+| npm 包信息 | `opencli npm package lodash` | **0.43s** | ~0.18s | ✅ 元数据完整 |
+| PyPI 包信息 | `opencli pypi package requests` | **0.46s** | ~0.20s | ✅ 元数据完整 |
+| crates 搜索 | `opencli crates search serde --limit 2` | **1.29s** | ~0.55s | ✅ 2 条结果 |
+| 适配器校验 | `opencli validate npm` | **0.35s** | ~0.30s | ✅ 3 命令全通过 |
+| 适配器校验 | `opencli validate pypi` | **0.35s** | ~0.30s | ✅ 2 命令全通过 |
+
+> \* 本地推算基于 Apple M2 Pro 32G + 100Mbps 网络环境。PUBLIC 策略主要瓶颈在网络延迟（API fetch），本地 100Mbps 网络的 RTT 通常比沙箱 5Mbps 低 50-60%，Node.js 启动和 JSON 解析在 M2 Pro 上也显著更快。
+
+### 3.2 不同环境耗时对照
+
+| 策略 | 沙箱（4C8G / 5Mbps） | 本地（M2 Pro / 100Mbps） | 瓶颈 |
+|------|----------------------|--------------------------|------|
+| **PUBLIC** | 0.4-1.3s | 0.2-0.6s | 网络 RTT |
+| **COOKIE** | 7-12s | 5-8s | 浏览器启动 + 页面加载 |
+| **INTERCEPT** | 10-15s | 8-12s | 页面加载 + 等待 XHR |
+| **UI** | 15-25s | 12-20s | DOM 渲染 + 元素操作 |
+| **waiy-browser-use**（对比） | 30-90s | 15-60s | 每步截图 + LLM 推理 |
+
+**结论**：OpenCLI 比 waiy-browser-use 快一个数量级。即使在最慢的 UI 策略下（沙箱 25s），也比 waiy-browser-use 的最快情况（15s）相当。在客户实际部署的镜像环境（4C8G + 5Mbps）中，PUBLIC/COOKIE 策略完全可用。
 
 ---
 
@@ -108,7 +177,7 @@ AI Agent（如 Claude Code）
 
 ### 4.1 一句话描述
 
-Claude Code 作为主 Agent 接收用户指令，优先用 OpenCLI 执行（快、稳），不行就用 waiy-browser-use 兜底（慢但通用）。云侧有个服务负责生成和维护 CLI 适配器。
+OpenClaw 作为主 Agent 接收用户指令，优先用 OpenCLI 执行（快、稳），不行就用 waiy-browser-use 兜底（慢但通用）。云侧有个服务负责生成和维护 CLI 适配器。
 
 ### 4.2 架构图
 
@@ -121,7 +190,7 @@ actor "客户用户" as User
 actor "研发" as Dev
 
 package "客户侧" {
-  [Claude Code\n(主 Agent)] as CC
+  [OpenClaw\n(主 Agent)] as CC
   [OpenCLI\n(Node 运行时)] as OC
   [waiy-browser-use\n(浏览器自动化)] as BU
 
@@ -130,7 +199,7 @@ package "客户侧" {
 }
 
 package "云侧（我们维护）" {
-  [CLI 生成服务\n(Claude Code\n+ opencli browser *)] as Factory
+  [CLI 生成服务\n(OpenClaw\n+ opencli browser *)] as Factory
   [巡检服务\n(cron + validate)] as Patrol
   database "Skill 仓库\n(Git)" as Repo
   [Chrome\n(debug 账号)] as Chrome
@@ -156,9 +225,9 @@ Chrome --> WebSys : debug 账号登录
 
 ### 4.3 这个 Skill 是什么形式？
 
-产品经理问的"给客户提供什么形式"，答案是 **Claude Code 的 Skill（`.claude/skills/`）**。
+产品经理问的"给客户提供什么形式"，答案是 **OpenClaw 的 Skill**。
 
-具体说：我们给客户的 Claude Code 环境配一个 skill，比如 `office-automation`，这个 skill 告诉 Claude Code：
+具体说：我们给客户的 OpenClaw 环境配一个 skill，比如 `office-automation`，这个 skill 告诉 OpenClaw：
 
 ```markdown
 # office-automation skill
@@ -167,17 +236,21 @@ Chrome --> WebSys : debug 账号登录
 
 ## 可用命令
 
-### 钉钉
-- `opencli dingtalk attendance --date-from 2026-06-01 --date-to 2026-06-13`
-  导出考勤数据
-- `opencli dingtalk send-message --group "行政群" --content "..."`
-  发送群消息
+### 阿里会议（alimeeting）
+- `opencli alimeeting rooms --date 2026-06-15 --floor 3F`
+  查询可用会议室
+- `opencli alimeeting my-bookings --date 2026-06-15`
+  查看我的预订
 
 ### ERP（金蝶）
 - `opencli kingdee voucher-list --period 202606`
   查询凭证列表
 - `opencli kingdee ap-aging`
   应付账龄分析
+
+### OA 系统
+- `opencli oa leave-list --month 2026-06`
+  查询请假记录
 
 ## 使用规则
 1. 优先使用 opencli 命令
@@ -189,68 +262,76 @@ Chrome --> WebSys : debug 账号登录
 
 ### 4.4 客户接入的完整过程
 
-以"钉钉考勤导出"为例，一步步说清楚：
+以"阿里会议室预订查询"为例（`https://meeting.alibaba-inc.com/alimeeting/web#/`），一步步说清楚：
 
 **第一步：拿到 debug 账号（1 天）**
 
-客户提供钉钉管理后台的 debug 账号密码。我们在云侧 Chrome 里登录，确认能访问考勤页面。
+客户提供阿里内网会议系统的 debug 账号。我们在云侧 Chrome 里登录，确认能访问会议室页面。
 
 **第二步：生成 CLI 适配器（2-4 小时/个系统）**
 
-研发（或 AI Agent）在 Claude Code 里操作：
+这是**录制阶段**。研发在 OpenClaw 里加载 `opencli-adapter-author` skill，让 Agent 驱动整个过程：
 
 ```bash
-# 1. 用 OpenCLI 浏览器原语打开钉钉后台
-opencli browser open "https://oa.dingtalk.com/attendance/list"
+# 1. Agent 先用 analyze 一步摸清站点结构
+opencli browser analyze "https://meeting.alibaba-inc.com/alimeeting/web#/" \
+    --trace on --keep-tab true --window foreground
+# 输出：Pattern B（SPA + 内部 API），推荐 COOKIE_API 策略
 
-# 2. 开始抓包
+# 2. Agent 开始抓包
 opencli browser network capture-start
 
-# 3. 在页面上操作（选日期、点查询、翻页）
-opencli browser click "查询按钮的选择器"
+# 3. Agent 在页面上操作——选楼层、选日期、点查询
+#    注意：这里 Agent 用 opencli browser click，不是 waiy-browser-use
+#    Agent 通过 opencli browser state 拿到页面元素编号，精确指定点哪个
+opencli browser state
+# 输出：[1] 日期选择器  [2] 楼层下拉  [3] 查询按钮  ...
+opencli browser click "[3]"
+# 耗时 <1s，确定性操作，不需要 AI 看截图判断
 
-# 4. 读取抓到的网络请求
-opencli browser network capture-read
-# 输出：发现 POST /api/attendance/list 返回 JSON，需要 Cookie 认证
+# 4. 读取网络请求
+opencli browser network capture-read -f json
+# 输出：发现 GET /api/meeting/room/list?date=...&floor=... 返回 JSON
 
-# 5. 分析 API 结构，写适配器
-# AI Agent 自动生成 clis/dingtalk/attendance.js：
+# 5. Agent 分析 API 结构，确定策略是 COOKIE_API
+#    Agent 按 SKILL.md 的 runbook 写 strategy note
+
+# 6. Agent 生成适配器骨架
+opencli browser init alimeeting/rooms
+
+# 7. Agent 编写适配器代码
 ```
 
 生成的适配器长这样：
 
 ```javascript
 cli({
-    site: 'dingtalk',
-    name: 'attendance',
+    site: 'alimeeting',
+    name: 'rooms',
     strategy: Strategy.COOKIE,    // 需要登录态
     browser: true,                // 需要浏览器（注入 Cookie）
     args: [
-        { name: 'date-from', required: true, help: '开始日期 YYYY-MM-DD' },
-        { name: 'date-to', required: true, help: '结束日期 YYYY-MM-DD' },
-        { name: 'department', help: '部门名称，默认全部' },
+        { name: 'date', required: true, help: '日期 YYYY-MM-DD' },
+        { name: 'floor', help: '楼层，如 "B1"、"3F"' },
+        { name: 'capacity', type: 'int', help: '最少容纳人数' },
     ],
-    columns: ['name', 'date', 'clockIn', 'clockOut', 'status', 'workHours'],
+    columns: ['name', 'floor', 'capacity', 'equipment', 'timeSlots', 'status'],
     pipeline: [
-        { navigate: 'https://oa.dingtalk.com/attendance/list' },
+        { navigate: 'https://meeting.alibaba-inc.com/alimeeting/web#/' },
         { evaluate: `
-            // 在页面中 fetch 考勤 API
-            const resp = await fetch('/api/attendance/list', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ dateFrom: '$date-from', dateTo: '$date-to' }),
-                credentials: 'include',  // 带上 Cookie
-            });
+            const resp = await fetch('/api/meeting/room/list?' + new URLSearchParams({
+                date: '$date', floor: '$floor' || '', minCapacity: '$capacity' || '0'
+            }), { credentials: 'include' });
             return await resp.json();
         `},
-        { map: 'data.list' },
-        { map: row => ({
-            name: row.userName,
-            date: row.workDate,
-            clockIn: row.checkInTime,
-            clockOut: row.checkOutTime,
-            status: row.status === 1 ? '正常' : '异常',
-            workHours: row.workHours,
+        { map: 'data.rooms' },
+        { map: room => ({
+            name: room.roomName,
+            floor: room.floorName,
+            capacity: room.capacity,
+            equipment: room.devices.join(', '),
+            timeSlots: room.availableSlots.map(s => s.startTime + '-' + s.endTime).join(', '),
+            status: room.availableSlots.length > 0 ? '可预订' : '已满',
         })},
     ],
 });
@@ -258,45 +339,47 @@ cli({
 
 **第三步：验证（30 分钟）**
 
+验证 = 确认录制出来的适配器真的能跑，相当于"单元测试"。
+
 ```bash
-# 校验适配器定义是否合法
-opencli validate dingtalk
+# 校验适配器定义是否合法（语法、字段对齐）
+opencli validate alimeeting
 # ✅ PASS, 1 command(s), Errors: 0
 
-# 用真实 Cookie 跑一次
-opencli dingtalk attendance --date-from 2026-06-01 --date-to 2026-06-13
-# ✅ 返回考勤数据，与页面核对一致
+# 用真实 Cookie 执行一次，核对返回数据与页面是否一致
+opencli alimeeting rooms --date 2026-06-15 --floor 3F
+# ✅ 返回会议室列表，与页面核对一致
+
+# 生成验证 fixture（回归基准）
+opencli browser verify alimeeting rooms --write-fixture
+# ✅ 写入 ~/.opencli/sites/alimeeting/verify/rooms.json
 ```
 
 **第四步：发布到 Skill 仓库（自动）**
 
 ```bash
-# 提交到 Git，打版本号
-git add clis/dingtalk/
-git commit -m "feat(dingtalk): add attendance CLI"
-git tag dingtalk-v1.0.0
+git add clis/alimeeting/
+git commit -m "feat(alimeeting): add room query CLI"
 git push
 ```
 
 **第五步：推送到客户端（自动/手动）**
 
-客户侧的 OpenCLI 运行环境定期或手动拉取更新：
-
 ```bash
 # 客户侧
-opencli plugin update dingtalk
+opencli plugin update alimeeting
 # 或者 rsync/scp 增量推送
 ```
 
-**第六步：用户使用**
+**第六步：用户使用（回放阶段）**
 
-用户在 Claude Code 里说"帮我导出本月考勤"，Claude Code 读到 skill 后知道该调：
+用户在 OpenClaw 里说"帮我查下明天 3 楼有哪些会议室可以用"，OpenClaw 读到 skill 后知道该调：
 
 ```bash
-opencli dingtalk attendance --date-from 2026-06-01 --date-to 2026-06-13 -f json
+opencli alimeeting rooms --date 2026-06-15 --floor 3F -f json
 ```
 
-7 秒返回结果。如果 CLI 不存在（比如用户说"帮我预定会议室"），Claude Code 降级调 waiy-browser-use 操作页面。
+5-8 秒返回结果。如果用户说"帮我预订明天下午 2 点 3 楼的 302 会议室"，而我们还没有 `alimeeting book` 这个 CLI，OpenClaw 降级调 waiy-browser-use 自主操作页面完成预订。
 
 ---
 
@@ -323,7 +406,7 @@ skinparam backgroundColor #FEFEFE
 
 ### 5.2 生成阶段
 
-**谁来做**：Claude Code（或研发手动）驱动 `opencli browser *` 原语。
+**谁来做**：OpenClaw（或研发手动）驱动 `opencli browser *` 原语。
 
 **过程**：打开网页 → 抓包 → 分析 API → 写适配器 → 验证。
 
@@ -354,7 +437,7 @@ skinparam backgroundColor #FEFEFE
 ```bash
 #!/bin/bash
 # patrol.sh — 每日巡检脚本
-SITES="dingtalk kingdee oa-system"
+SITES="alimeeting kingdee oa-system"
 
 for site in $SITES; do
     # 1. 校验定义
@@ -399,7 +482,7 @@ done
    - 登录态过期 → 重新用 debug 账号登录，刷新 Cookie
    - 数据结构变化 → 重新抓包，对比新旧 JSON 结构，更新 `columns` 和 `map`
 3. **半自动修复**：
-   - API 路径变了 → Claude Code 重新 explore 页面，发现新 API，更新适配器
+   - API 路径变了 → OpenClaw 重新 explore 页面，发现新 API，更新适配器
 4. **人工修复**：
    - 整个前端重构 → 需要重新走一遍生成流程
 
@@ -428,41 +511,40 @@ done
 
 ## 六、技术架构细节
 
-### 6.1 Claude Code 作为主 Agent 的工作方式
+### 6.1 OpenClaw 作为主 Agent 的工作方式
 
-不需要自己造主 Agent。Claude Code 本身就是一个强大的 Agent，它能：
+不需要自己造主 Agent 框架。OpenClaw 本身就是一个强大的 Agent，它能：
 
 - 理解自然语言指令
 - 调用 Bash 执行 `opencli` 命令
 - 读取命令输出，做后续处理（汇总、分析、生成报表）
 - 调用 waiy-browser-use 的 Python API 作为降级路径
 
-**Skill 的形式**就是一个 `.claude/skills/office-automation.md` 文件，告诉 Claude Code 有哪些 `opencli` 命令可用、怎么用、什么时候该降级。
+**Skill 的形式**就是一个 `.claude/skills/office-automation.md` 文件，告诉 OpenClaw 有哪些 `opencli` 命令可用、怎么用、什么时候该降级。
 
 ### 6.2 一次完整的用户交互
 
-用户说："帮我导出本月钉钉考勤，标记异常的人"
+用户说："帮我查一下明天 3 楼有哪些会议室能用，要能容纳 10 人以上的"
 
-Claude Code 的执行过程：
+OpenClaw 的执行过程：
 
 ```
-1. 理解意图：导出考勤 + 标记异常
-2. 读取 skill：发现有 opencli dingtalk attendance
+1. 理解意图：查询可用会议室 + 筛选容量
+2. 读取 skill：发现有 opencli alimeeting rooms
 3. 执行命令：
-   $ opencli dingtalk attendance \
-       --date-from 2026-06-01 --date-to 2026-06-13 -f json
-   # 7 秒返回 JSON 数据
-4. 用 Python/pandas 处理数据：
-   - 筛选 status="异常" 的记录
-   - 按人汇总异常天数
+   $ opencli alimeeting rooms \
+       --date 2026-06-15 --floor 3F --capacity 10 -f json
+   # 5 秒返回 JSON 数据
+4. 处理数据：
+   - 筛选 capacity >= 10 且 status="可预订" 的会议室
+   - 按可用时段排列
 5. 返回给用户：
-   "本月共 3 人考勤异常：
-    - 张三：迟到 2 次（6/3, 6/7）
-    - 李四：早退 1 次（6/10）
-    - 王五：缺卡 1 次（6/12）"
+   "明天 3 楼有 2 间会议室可用（10 人以上）：
+    - 302 大会议室（20 人，投影+白板）：10:00-12:00, 14:00-17:00
+    - 305 培训室（30 人，投影+视频会议）：09:00-11:00"
 ```
 
-如果用户说的是 CLI 没有覆盖的操作（比如"帮我在 OA 上提交一个请假申请"），Claude Code 降级：
+如果用户说的是 CLI 没有覆盖的操作（比如"帮我在 OA 上提交一个请假申请"），OpenClaw 降级：
 
 ```
 1. 理解意图：提交请假申请
@@ -500,7 +582,7 @@ skinparam activityShape roundedBox
 start
 :用户发起指令;
 
-:Claude Code 解析意图;
+:OpenClaw 解析意图;
 
 if (有匹配的 opencli 命令?) then (是)
   :opencli 执行\n(0.5-10s);
@@ -544,7 +626,7 @@ stop
 ```
 Chrome 实例
 ├── Profile: customer-A
-│   ├── Tab 1: 钉钉后台 (已登录)
+│   ├── Tab 1: 阿里会议 (已登录)
 │   ├── Tab 2: 金蝶 ERP (已登录)
 │   └── Tab 3: OA 系统 (已登录)
 └── Cookie Store: encrypted at rest
@@ -560,49 +642,11 @@ Chrome 实例
 
 ### 7.2 生成流程实操
 
-以钉钉考勤为例，完整的操作记录：
+详见第四章 4.4 节的阿里会议室完整示例。这里补充几个要点：
 
-```bash
-# 1. 打开钉钉后台考勤页面
-$ opencli browser open "https://oa.dingtalk.com/attendance/list" \
-    --keep-tab true --window foreground
-# 耗时：3-5s（页面加载）
-
-# 2. 开始抓包
-$ opencli browser network capture-start
-# 耗时：<1s
-
-# 3. 在页面上操作——选日期、点查询
-$ opencli browser click "#date-picker"
-$ opencli browser type "#date-picker" "2026-06-01"
-$ opencli browser click "#search-btn"
-# 耗时：5-10s
-
-# 4. 读取网络请求
-$ opencli browser network capture-read -f json
-# 输出类似：
-# [
-#   { "url": "/api/attendance/list", "method": "POST",
-#     "status": 200, "contentType": "application/json",
-#     "requestHeaders": { "Cookie": "...", "X-CSRF-Token": "..." },
-#     "responseBody": { "data": { "list": [...] } } }
-# ]
-# 耗时：<1s
-
-# 5. 分析 API，确定策略
-# 观察到：需要 Cookie + X-CSRF-Token → 策略是 HEADER
-
-# 6. 写适配器（AI 或手动）
-# 创建 clis/dingtalk/attendance.js
-
-# 7. 验证
-$ opencli validate dingtalk
-# ✅ PASS
-$ opencli dingtalk attendance --date-from 2026-06-01 --date-to 2026-06-13
-# ✅ 返回数据
-```
-
-**总耗时**：30 分钟-2 小时（取决于 API 复杂度和认证方式）。
+- **整个录制过程是 AI Agent 操作**，不是人手动点。Agent 加载 `opencli-adapter-author` skill 后，按 SKILL.md 里的决策树 + runbook 自动执行 `opencli browser *` 命令。研发的角色是发起任务 + review 产出。
+- **`opencli browser click` 和 `opencli browser state` 是 Agent 的"手和眼"**。Agent 用 `state` 看页面有哪些元素（带编号），用 `click "[3]"` 精确点击——这是确定性操作，不依赖 LLM 看截图判断。
+- **总耗时**：30 分钟-2 小时/个 API（取决于 API 复杂度和认证方式）。
 
 ---
 
@@ -610,7 +654,7 @@ $ opencli dingtalk attendance --date-from 2026-06-01 --date-to 2026-06-13
 
 | 架构组件 | 现有代码 | 状态 |
 |---------|---------|------|
-| 主 Agent | Claude Code 本身 | ✅ 直接使用 |
+| 主 Agent | OpenClaw | ✅ 直接使用 |
 | OpenCLI 执行引擎 | `src/execution.ts` / HTTP daemon :19825 | ✅ 已有 |
 | 浏览器操作原语 | `opencli browser *`（30+ 子命令） | ✅ 已有 |
 | 适配器编写 skill | `skills/opencli-adapter-author/SKILL.md` | ✅ 已有 |
@@ -630,7 +674,7 @@ $ opencli dingtalk attendance --date-from 2026-06-01 --date-to 2026-06-13
 |------|------|------|------|
 | 1. 获取 debug 账号 | 1 天 | 账号密码 + 系统 URL 清单 | 客户 |
 | 2. 云侧 Chrome 登录 | 1 小时 | 各系统登录态就绪 | 研发 |
-| 3. 逐系统生成 CLI | 1-2 天/系统 | `clis/<site>/*.js` 适配器 | Claude Code + 研发 review |
+| 3. 逐系统生成 CLI | 1-2 天/系统 | `clis/<site>/*.js` 适配器 | OpenClaw + 研发 review |
 | 4. 验证全部 CLI | 半天 | `opencli validate` + 实际执行全部通过 | 研发 |
 | 5. 编写客户 Skill | 2 小时 | `.claude/skills/office-automation.md` | 研发 |
 | 6. 部署到客户端 | 半天 | OpenCLI + Skill 在客户环境跑通 | 研发 + 客户 IT |
@@ -641,12 +685,12 @@ $ opencli dingtalk attendance --date-from 2026-06-01 --date-to 2026-06-13
 
 ## 十、MVP 建议
 
-第一个客户的第一个场景："钉钉考勤导出 + 异常标记"。
+第一个客户的第一个场景："阿里会议室查询 + 预订"。
 
 | 模块 | MVP 范围 | 不做什么 |
 |------|---------|---------|
-| 主 Agent | Claude Code + 1 个 skill 文件 | 不造新 Agent 框架 |
-| CLI 生成 | 手动 Claude Code + opencli browser | 不做全自动 explore |
+| 主 Agent | OpenClaw + 1 个 skill 文件 | 不造新 Agent 框架 |
+| CLI 生成 | 手动 OpenClaw + opencli browser | 不做全自动 explore |
 | CLI 执行 | 直接跑 opencli 命令 | 不做 HTTP daemon |
 | 降级路径 | 直接 `Agent.run()` | 不做自动降级路由 |
 | 巡检 | cron + shell 脚本 | 不做巡检平台 UI |
