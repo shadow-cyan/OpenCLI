@@ -85,21 +85,38 @@ $ opencli npm search react -f json --limit 3
 
 **客户的 OA/ERP/钉钉/企微**，绝大多数走 COOKIE 或 HEADER 策略。因为这些系统的前端操作背后都有 JSON API，只需要登录态。
 
-### 2.3 录制 vs 回放——两个独立阶段
+### 2.3 三个阶段：录制 → 巡检 → 回放
 
-整个办公自动化分两个完全不同的阶段：
+整个办公自动化分三个阶段：
 
-| | 录制（生成适配器） | 回放（执行办公任务） |
-|---|---|---|
-| **谁操作** | 我方研发 + 主 Agent（AI 驱动） | 客户的主 Agent（自动执行） |
-| **频率** | 一次性（每个 API 做一次） | 反复执行（每天/每周） |
-| **用的 Skill** | `opencli-adapter-author`（内部研发用） | 客户的 `office-automation`（我们交付的） |
-| **核心操作** | `opencli browser analyze/network/init/verify` | `opencli <site> <command>`（直接调用已有适配器） |
-| **需要浏览器** | 需要（侦察 + 验证） | 看 strategy：PUBLIC 不需要，COOKIE/UI 需要 |
-| **产出** | `clis/<site>/<name>.js` 适配器文件 | 结构化数据（JSON/表格） |
-| **耗时** | 30 分钟-2 小时/个 API | 0.5-10 秒/次执行 |
+```
+录制（一次性）          巡检（持续）              回放（日常）
+┌──────────┐       ┌──────────────┐        ┌──────────┐
+│ 研发 + Agent    │       │ cron 自动       │        │ 客户使用   │
+│ 生成适配器      │──→    │ 定期跑 validate  │──→     │ 调用 CLI   │
+│ 30min-2h/个API │       │ + 实际执行       │        │ 0.5-10s    │
+└──────────┘       │ 失效→自动修复    │        └──────────┘
+                   └──────────────┘
+```
 
-**打个比方**：录制就像铺铁轨，回放就像跑火车。铺一次轨，火车跑无数趟。
+| | 录制（生成适配器） | 巡检（持续维护） | 回放（执行办公任务） |
+|---|---|---|---|
+| **谁操作** | 我方研发 + 主 Agent | cron 定时 + `opencli-autofix` skill | 客户的主 Agent（自动） |
+| **频率** | 一次性（每个 API 做一次） | 每天/每周自动执行 | 反复执行（每天/每周） |
+| **用的 Skill** | `opencli-adapter-author` | `opencli-autofix`（失效时自动修复） | 客户的 `office-automation` |
+| **核心操作** | `browser analyze/network/init/verify` | `validate` + 实际执行 + 比对 fixture | `opencli <site> <command>` |
+| **需要浏览器** | 需要（侦察 + 验证） | COOKIE/UI 策略需要 | 看 strategy |
+| **产出** | `clis/<site>/<name>.js` 适配器 | 健康报告 / 修复 patch | 结构化数据 |
+| **耗时** | 30min-2h / 个 API | 巡检 <1min/命令；修复 1min-4h | 0.5-10s / 次 |
+
+**打个比方**：录制 = 铺铁轨；巡检 = 铁路养护队定期检查轨道、发现裂缝就修；回放 = 跑火车。铺一次轨，养护队持续巡查，火车跑无数趟。
+
+**巡检具体做什么**：
+
+1. **每天**：cron 跑 `opencli validate <site>` 校验适配器定义 + 对每个命令执行一次（取前 3 条数据），确认接口可达、返回非空
+2. **每周**：比对返回数据与 fixture（`verify/<cmd>.json`）的结构，检查字段是否变化
+3. **失效时**：自动触发 `opencli-autofix` skill——诊断错误类型（401/404/字段缺失）→ 用 `opencli browser` 重新探查 → 自动 patch 适配器 → 重试（最多 3 轮）
+4. **修不了时**：告警通知研发手动介入（相当于回到录制阶段重做）
 
 ### 2.4 `opencli browser click` vs waiy-browser-use——有什么区别
 
@@ -121,24 +138,34 @@ waiy-browser-use 用在**回放阶段的降级路径**——当客户说了一�
 
 项目里有 7 个 Skill，按角色分：
 
-**录制阶段用的（内部研发）：**
+**录制阶段（内部研发）：**
 
 | Skill | 做什么 | 什么时候用 |
 |---|---|---|
 | `opencli-adapter-author` | **主力**。完整的适配器生成决策树 + runbook | 给新站点写 CLI 时 |
 | `opencli-browser` | 浏览器操作手册（`state/find/click/type/network` 等全部子命令的用法） | adapter-author 过程中驱动浏览器 |
-| `opencli-autofix` | 自动修复失效适配器（诊断 → 探查 → patch → 重试，最多 3 轮） | 巡检发现 CLI 挂了时 |
 | `opencli-sitemap-author` | 站点地图编写（记录页面结构和导航路径） | 复杂站点需要先摸清页面结构时 |
 | `opencli-browser-sitemap` | 站点地图消费（读取已有 sitemap 加速侦察） | 有 sitemap 的站点，跳过重复探索 |
 | `opencli-usage` | 入门指南（命令总览、策略说明、路由表） | 不知道用什么命令时查 |
 
-**回放阶段用的（交付给客户）：**
+**巡检阶段（自动/半自动）：**
+
+| Skill | 做什么 | 什么时候用 |
+|---|---|---|
+| `opencli-autofix` | 自动修复失效适配器（诊断 → 探查 → patch → 重试，最多 3 轮） | 巡检发现 CLI 挂了时自动触发 |
+
+**回放阶段（交付给客户）：**
 
 | Skill | 做什么 |
 |---|---|
 | `office-automation`（我们编写交付） | 告诉 OpenClaw 有哪些 opencli 命令可用、怎么调、什么时候降级到 waiy-browser-use |
 
 **注意**：客户不需要接触上面 6 个内部 Skill。客户只看到一个 `office-automation` skill，里面列出了所有可用的 CLI 命令和使用规则。
+
+**校验不需要单独的 Skill**。`opencli validate` 和 `opencli browser verify` 是 OpenCLI 的内置命令，不是 Skill。它们在录制阶段由 `adapter-author` skill 调用验证，在巡检阶段由 cron 脚本直接调用。区分一下：
+- **Skill** = 给 AI Agent 看的决策指南（"什么时候做什么"）
+- **命令** = 实际执行的工具（`validate`、`verify`、`browser click` 等）
+- Skill 调用命令，命令本身不需要 Skill 就能跑
 
 ---
 
