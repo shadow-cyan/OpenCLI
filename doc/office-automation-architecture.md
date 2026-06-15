@@ -40,7 +40,43 @@
 
 **选型结论**：**OpenCLI 做主力（覆盖已知的高频操作），waiy-browser 做降级（覆盖未知或低频操作）**。两者不是替代关系，而是互补——OpenCLI 的覆盖范围随使用逐步扩大（降级执行的轨迹可以反馈生成新 CLI），最终降级越来越少。
 
-### 1.4 读 vs 写的实现策略
+### 1.4 核心产品思路
+
+**用高级 Agent 借助 OpenCLI 预先生成结构化产物，客户侧 Agent 消费这些产物来高效完成网站操作。**
+
+录制阶段产出的不止是 CLI 适配器，而是一组完整的**站点知识产物**：
+
+| 产物 | 位置 | 内容 | 给谁用 |
+|------|------|------|--------|
+| **CLI 适配器** | `clis/<site>/<cmd>.js` | 参数化的 API 调用封装 | OpenCLI 执行引擎（确定性执行，最快） |
+| **站点地图** | `sitemaps/<site>/` | 页面结构、操作路径、已知坑 | 客户 Agent 降级操作时参考 |
+| **Skill 文件** | `.claude/skills/office-automation.md` | 可用命令清单 + 降级规则 | 客户 Agent 决策 |
+
+以阿里会议室为例，录制产出的站点地图结构：
+
+```
+sitemaps/alimeeting/
+├── SITE.md                      # 站点概述：会议室预订系统，需内网 SSO 登录
+├── pages/
+│   ├── home.md                  # 首页：日历视图 + "预订"入口按钮
+│   ├── booking-form.md          # 预订表单页：会议室/时间/时长/参会人
+│   └── confirm.md               # 确认页：提交后出现预订成功标志
+├── workflows/
+│   └── book-room.md             # 从首页到订成的完整操作路径
+└── pitfalls.md                  # 已知坑：时间冲突提示、跨天预订限制
+```
+
+**站点地图的价值在降级时体现**：当客户 Agent 降级到 waiy-browser-page 操作网页时，它不需要从零探索——读 sitemap 就知道该去哪个页面、走什么路径、有什么坑要避开。这让降级操作更快、更可靠。
+
+三层产物形成**覆盖梯度**：
+
+```
+CLI 适配器存在 → 直接调 opencli（0.5-10s，100% 可靠）
+CLI 适配器不存在，但有站点地图 → Agent 参考 sitemap 降级操作（10-40s，可靠性高）
+都没有 → Agent 盲操作（30-180s，可靠性低）
+```
+
+### 1.5 读 vs 写的实现策略
 
 | | 读（查询/提取） | 写（提交/操作） |
 |---|---|---|
@@ -262,7 +298,7 @@ end note
 | **用的 Skill** | `opencli-adapter-author` | `opencli-autofix`（失效时自动修复） | `office-automation` |
 | **工具链** | A（opencli browser *） | A（validate/verify） | opencli 优先，B（waiy-browser）降级 |
 | **需要浏览器** | 需要（探索 + 验证） | COOKIE/UI 策略需要 | 看 strategy |
-| **产出** | `clis/<site>/<name>.js` 适配器 | 健康报告 / 修复 patch | 结构化数据 |
+| **产出** | 适配器 + 站点地图 + Skill | 健康报告 / 修复 patch | 结构化数据 |
 | **耗时** | 30min-2h / 个 API | 巡检 <1min/命令；修复 1min-4h | 0.5-10s / 次 |
 
 > **录制阶段不一定需要研发**。用户也可以在 OpenClaw 里加载 `opencli-adapter-author` skill，让 Agent 帮你录制。但企业内网系统（OA/ERP）的 API 认证通常比较复杂，建议研发先做，后续简单站点用户可以自助。
@@ -276,7 +312,7 @@ end note
 
 ## 五、回放阶段的降级路径
 
-客户日常使用时，主 Agent 按以下优先级执行用户指令：
+客户日常使用时，主 Agent 按以下优先级执行用户指令。**站点地图在降级时起关键作用**——Agent 读取 sitemap 知道该去哪个页面、走什么路径、避开什么坑，不需要从零探索。
 
 ```plantuml
 @startuml
@@ -298,8 +334,10 @@ if (有匹配的 opencli 命令?) then (是)
 else (否)
 endif
 
-if (流程清晰，可分步描述?) then (是)
-  :waiy-browser-page 分步执行\n(10-40s，每步调 LLM);
+:读取站点地图（如有）\n获取页面结构、操作路径、已知坑;
+
+if (有 sitemap + 流程清晰?) then (是)
+  :参考 sitemap\nwaiy-browser-page 分步执行\n(10-40s，每步调 LLM);
   if (成功?) then (是)
     :返回结果;
     :记录执行轨迹;
@@ -328,7 +366,7 @@ stop
 | 维度 | OpenCLI | waiy-browser-page（中层） | waiy-browser-agent（高层） |
 |------|---------|--------------------------|--------------------------|
 | 速度 | 0.5-10s | 10-40s（3-5 步） | 30-180s |
-| 可靠性 | 高（固定 API 调用） | 中（LLM 每步推理） | 中低（多步 LLM 累积误差） |
+| 可靠性 | 高（固定 API 调用） | 中（有 sitemap 时更高） | 中低（多步 LLM 累积误差） |
 | 覆盖范围 | 低（需预先生成适配器） | 高（任何网页） | 高（任何网页） |
 | LLM 成本 | 无 | 每步调一次 LLM | 持续调 LLM（规划 + 执行） |
 | 控制粒度 | 精确（参数化 CLI） | 中（调用者分步控制） | 低（只给目标，Agent 自主） |
