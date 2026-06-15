@@ -2,8 +2,6 @@
 
 > 基于 OpenCLI + waiy-browser + 主 Agent（OpenClaw）的企业办公自动化方案。
 
----
-
 ## 一、目标与范围
 
 ### 1.1 要解决什么问题
@@ -52,13 +50,66 @@
 
 OpenCLI 不只是"读"。适配器的 `pipeline` 可以执行任意浏览器内操作（包括表单填写和提交），只要 API 存在就能封装。区别在于：读操作通常对应 GET 请求，写操作对应 POST/PUT 请求——但对 OpenCLI 来说都是 `fetch`。
 
----
-
 ## 二、工具与技能全景
 
 在进入具体流程之前，先介绍本方案涉及的所有工具和技能，后续章节会反复引用。
 
-### 2.1 OpenCLI——确定性 CLI 适配器
+### 2.1 两条独立的工具链
+
+本方案有两条工具链，各自独立，**不混排使用**：
+
+```plantuml
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam componentStyle rectangle
+
+package "工具链 A：OpenCLI" {
+  [opencli browser *\n(state/click/type/network)\n确定性浏览器操作] as OB
+  [opencli validate / verify\n适配器校验与验证] as OV
+  [生成的适配器\nclis/<site>/<cmd>.js] as OA
+
+  OB -down-> OA : 录制阶段\n探索 API → 生成适配器
+  OV -left-> OA : 验证适配器
+}
+
+package "工具链 B：waiy-browser" {
+  [waiy-browser\n(底层：snapshot/click)\n确定性操作，执行基座] as WB
+  [waiy-browser-page\n(中层：page_use_*)\nLLM 辅助单步操作] as WP
+  [waiy-browser-agent\n(高层：execute_task)\n全自主多步任务] as WA
+
+  WP -down-> WB : 内部调用
+  WA -down-> WB : 内部调用
+}
+
+note bottom of OB
+  录制阶段专用
+  Agent 用 state 看页面
+  用 click 精确操作
+  编号来自 state 输出
+end note
+
+note bottom of WB
+  不能与 opencli browser
+  混合使用——两者的
+  元素编号体系不同
+  操作后需各自重新观测
+end note
+
+@enduml
+```
+
+**为什么不能混排**：`opencli browser state` 和 `waiy-browser snapshot` 都返回带编号的页面元素列表，但编号体系各自独立。如果在 `opencli browser state` 之后调用 `waiy-browser click_element_by_index`，编号对不上。反之亦然。每条工具链内部的操作是连贯的，切换工具链后必须重新观测页面状态，之前的编号全部失效。
+
+**各阶段使用哪条工具链**：
+
+| 阶段 | 使用的工具链 | 原因 |
+|------|-------------|------|
+| **录制** | 工具链 A（opencli browser *） | 需要抓包、分析 API、生成适配器骨架——这些是 OpenCLI 独有的能力 |
+| **巡检** | 工具链 A（opencli validate/verify） | 校验和回归测试都是 OpenCLI 内置命令 |
+| **回放（有 CLI）** | 直接调 `opencli <site> <command>` | 适配器已生成，不需要浏览器操作 |
+| **回放（降级）** | 工具链 B（waiy-browser-page / agent） | 没有 CLI 覆盖时，用 LLM 驱动浏览器完成任务 |
+
+### 2.2 OpenCLI——确定性 CLI 适配器
 
 OpenCLI 把网站操作封装成命令行接口。目前已有 154 个站点适配器。一个适配器的核心结构：
 
@@ -89,7 +140,7 @@ cli({
 
 **适配器 = 一个网站操作的标准化封装**。声明参数 → 调 API → 格式化输出。写好之后，`opencli <site> <command>` 一行命令调用，不需要知道背后的 API 细节。
 
-### 2.2 waiy-browser 三层架构
+### 2.3 waiy-browser 三层架构
 
 waiy-browser 提供三个层级的浏览器自动化能力：
 
@@ -108,31 +159,26 @@ waiy-browser 提供三个层级的浏览器自动化能力：
 
 **高层**：接收一个自然语言任务描述，内置 Agent 自主规划和执行所有步骤。适合流程复杂或不确定的一次性操作。同一时间只能运行一个 `execute_task`，超时至少 600s。
 
-### 2.3 Skill 清单
+### 2.4 Skill 清单
 
 Skill 是给 AI Agent 看的决策指南（"什么时候做什么、怎么做"），Agent 根据 Skill 的指引调用具体的命令。命令本身不需要 Skill 就能执行。
 
-**录制阶段（生成适配器）用到的 Skill：**
+**工具链 A（OpenCLI）相关 Skill：**
 
-| Skill | 做什么 | 什么时候用 |
-|---|---|---|
-| `opencli-adapter-author` | **主力**。完整的适配器生成决策树 + runbook | 给新站点写 CLI 时 |
-| `opencli-browser` | 浏览器操作手册（`state/find/click/type/network` 等子命令的用法） | adapter-author 过程中驱动浏览器 |
-| `opencli-sitemap-author` | 站点地图编写（记录页面结构和导航路径） | 复杂站点需要先摸清页面结构时 |
-| `opencli-browser-sitemap` | 站点地图消费（读取已有 sitemap 加速探索） | 有 sitemap 的站点，跳过重复探索 |
-| `opencli-usage` | 入门指南（命令总览、策略说明、路由表） | 不知道用什么命令时查 |
+| Skill | 所属阶段 | 做什么 | 什么时候用 |
+|---|---|---|---|
+| `opencli-adapter-author` | 录制 | **主力**。完整的适配器生成决策树 + runbook | 给新站点写 CLI 时 |
+| `opencli-browser` | 录制 | 浏览器操作手册（`state/find/click/type/network` 等子命令的用法） | adapter-author 过程中驱动浏览器 |
+| `opencli-sitemap-author` | 录制 | 站点地图编写（记录页面结构和导航路径） | 复杂站点需要先摸清页面结构时 |
+| `opencli-browser-sitemap` | 录制 | 站点地图消费（读取已有 sitemap 加速探索） | 有 sitemap 的站点，跳过重复探索 |
+| `opencli-usage` | 录制 | 入门指南（命令总览、策略说明、路由表） | 不知道用什么命令时查 |
+| `opencli-autofix` | 巡检 | 自动修复失效适配器（诊断 → 探查 → patch → 重试，最多 3 轮） | 巡检发现 CLI 失效时自动触发 |
 
-**巡检阶段（自动维护）用到的 Skill：**
-
-| Skill | 做什么 | 什么时候用 |
-|---|---|---|
-| `opencli-autofix` | 自动修复失效适配器（诊断 → 探查 → patch → 重试，最多 3 轮） | 巡检发现 CLI 失效时自动触发 |
-
-**浏览器自动化（waiy-browser 技能栈）：**
+**工具链 B（waiy-browser）相关 Skill：**
 
 | Skill | 层级 | 做什么 | 什么时候用 |
 |---|---|---|---|
-| `waiy-browser` | 底层 | 确定性浏览器操作 | 录制阶段 Agent 探索网站；page/agent 层的执行基座 |
+| `waiy-browser` | 底层 | 确定性浏览器操作 | page/agent 层的执行基座（不直接在回放中独立使用） |
 | `waiy-browser-page` | 中层 | 自然语言单页操作 | 回放降级（分步操作）；结构化数据提取 |
 | `waiy-browser-agent` | 高层 | 全自主多步任务执行 | 回放降级（复杂任务兜底） |
 
@@ -140,11 +186,11 @@ Skill 是给 AI Agent 看的决策指南（"什么时候做什么、怎么做"�
 
 | Skill | 做什么 |
 |---|---|
-| `office-automation` | 告诉 OpenClaw 有哪些 opencli 命令可用、怎么调、什么时候降级到 waiy-browser-page / waiy-browser-agent |
+| `office-automation` | 告诉主 Agent 有哪些 opencli 命令可用、怎么调、什么时候降级到 waiy-browser-page / waiy-browser-agent |
 
 客户只看到 `office-automation` 这一个 Skill，不需要接触上面的开发和维护 Skill。
 
-### 2.4 内置命令（不需要 Skill）
+### 2.5 内置命令（不需要 Skill）
 
 | 命令 | 做什么 | 在哪个阶段用 |
 |------|--------|-------------|
@@ -153,8 +199,6 @@ Skill 是给 AI Agent 看的决策指南（"什么时候做什么、怎么做"�
 | `opencli browser analyze <url>` | 分析站点结构，推荐认证策略 | 录制（起步） |
 | `opencli browser network capture-*` | 抓包（开始/读取/停止） | 录制（发现 API） |
 | `opencli browser state/click/type` | 查看页面元素 / 操作元素 | 录制（Agent 探索页面） |
-
----
 
 ## 三、认证策略
 
@@ -169,8 +213,6 @@ Skill 是给 AI Agent 看的决策指南（"什么时候做什么、怎么做"�
 | **UI** | 直接操作 DOM 提取数据（无可用 API） | ~15s+ | 无 JSON API 的遗留系统 |
 
 **客户的办公系统**（OA/ERP/企微/会议系统等），绝大多数走 COOKIE 或 HEADER 策略——这些系统的前端操作背后都有 JSON API，只需要登录态。写操作（提交表单）同样是调 API（POST/PUT），只是请求方法不同。
-
----
 
 ## 四、三个阶段：录制 → 巡检 → 回放
 
@@ -192,13 +234,13 @@ P -left-> R : 修不了时\n重新录制
 note bottom of R
   研发 / 用户 + Agent
   Skill: opencli-adapter-author
-  工具: opencli browser *
+  工具链 A: opencli browser *
   30min-2h / 个 API
 end note
 
 note bottom of P
   定时任务自动运行
-  工具: validate + 实际执行
+  工具链 A: validate + 实际执行
   Skill: opencli-autofix（失效时）
   <1min / 命令
 end note
@@ -206,7 +248,7 @@ end note
 note bottom of E
   客户使用
   Skill: office-automation
-  工具: opencli + waiy-browser（降级）
+  优先 opencli，降级工具链 B
   0.5-10s / 次（CLI）
 end note
 
@@ -218,7 +260,7 @@ end note
 | **谁操作** | 研发或用户 + 主 Agent | 定时任务 + `opencli-autofix` skill | 客户的主 Agent（自动） |
 | **频率** | 一次性（每个 API 做一次） | 每天/每周自动执行 | 反复执行（每天/每周） |
 | **用的 Skill** | `opencli-adapter-author` | `opencli-autofix`（失效时自动修复） | `office-automation` |
-| **核心操作** | `browser analyze/network/init/verify` | `validate` + 实际执行 + 比对 fixture | `opencli <site> <command>` |
+| **工具链** | A（opencli browser *） | A（validate/verify） | opencli 优先，B（waiy-browser）降级 |
 | **需要浏览器** | 需要（探索 + 验证） | COOKIE/UI 策略需要 | 看 strategy |
 | **产出** | `clis/<site>/<name>.js` 适配器 | 健康报告 / 修复 patch | 结构化数据 |
 | **耗时** | 30min-2h / 个 API | 巡检 <1min/命令；修复 1min-4h | 0.5-10s / 次 |
@@ -232,11 +274,9 @@ end note
 3. **失效时**：自动触发 `opencli-autofix` skill——诊断错误类型（401/404/字段缺失）→ 用 `opencli browser` 重新探查 → 自动 patch 适配器 → 重试（最多 3 轮）
 4. **修不了时**：告警通知研发手动介入（回到录制阶段重做）
 
----
-
 ## 五、回放阶段的降级路径
 
-客户日常使用时，OpenClaw 按以下优先级执行用户指令：
+客户日常使用时，主 Agent 按以下优先级执行用户指令：
 
 ```plantuml
 @startuml
@@ -245,7 +285,7 @@ skinparam activityShape roundedBox
 start
 :用户发起指令;
 
-:OpenClaw 解析意图;
+:主 Agent 解析意图;
 
 if (有匹配的 opencli 命令?) then (是)
   :opencli 执行\n(0.5-10s，无 LLM);
@@ -274,13 +314,6 @@ endif
 if (成功?) then (是)
   :返回结果;
   :记录执行轨迹;
-  note right
-    轨迹包含：
-    - 访问的 URL
-    - 发现的 API
-    - 页面操作步骤
-    → 供后续生成 CLI 参考
-  end note
 else (否)
   :请求人工介入;
 endif
@@ -332,11 +365,60 @@ waiy-browser-agent execute_task \
 # 总耗时 30-180s
 ```
 
-### 5.3 Skill 自进化
+### 5.3 Skill 自进化——降级轨迹如何转化为新 CLI
 
-降级执行的轨迹（访问的 URL、发现的 API、操作步骤）会被记录下来，供后续生成新的 CLI 适配器参考。**用得越多，CLI 覆盖越广，降级越少**。
+降级执行不是终点，而是 CLI 扩展的信号源。
 
----
+**轨迹记录的内容**：
+
+waiy-browser-page 和 waiy-browser-agent 执行时，底层的每一步操作都会产生日志：
+- 访问的 URL 和页面跳转路径
+- 触发的网络请求（URL、Method、Request/Response Body）
+- DOM 操作序列（点了什么元素、填了什么值）
+- 页面状态变化（操作前后的关键 DOM 结构）
+
+**转化流程**：
+
+```plantuml
+@startuml
+skinparam activityShape roundedBox
+skinparam backgroundColor #FEFEFE
+
+start
+:降级执行完成\n(waiy-browser-page / agent);
+:记录执行轨迹;
+
+if (轨迹中发现了 JSON API?) then (是)
+  :提取 API 信息\n(URL、参数、返回结构);
+  :判断认证策略\n(COOKIE/HEADER/INTERCEPT);
+  :Agent 加载 opencli-adapter-author\n根据 API 信息生成适配器;
+  :验证 → 发布;
+  :更新 office-automation Skill\n增加新命令;
+  note right
+    下次相同操作
+    直接走 OpenCLI
+    不再降级
+  end note
+else (否——纯 UI 操作，无 API)
+  :标记为 UI 策略候选;
+  :累计调用频次;
+  if (频次 > 阈值?) then (是)
+    :人工评估是否值得\n编写 UI 策略适配器;
+  else (否)
+    :保持降级执行;
+  endif
+endif
+
+stop
+
+@enduml
+```
+
+**关键判断逻辑**：
+- 如果降级过程中**发现了 JSON API**（Network 请求里有 JSON 响应），说明这个操作可以用 COOKIE/HEADER/INTERCEPT 策略封装成 CLI，值得立即生成适配器
+- 如果降级过程是**纯 UI 操作**（没有可用的 JSON API），生成 CLI 的成本较高（UI 策略适配器编写复杂、维护成本大），只有在调用频次足够高时才值得投入
+
+**效果**：随着使用量增长，高频操作逐步从降级路径"毕业"到 OpenCLI，降级比例持续下降。理想状态下，客户日常 90%+ 的操作都走 OpenCLI（秒级响应），只有偶发的新操作才触发降级。
 
 ## 六、实测数据
 
@@ -370,11 +452,15 @@ waiy-browser-agent execute_task \
 
 OpenCLI 比 waiy-browser-page 快一个数量级，比 waiy-browser-agent 快两个数量级。降级层的 LLM 调用是主要成本来源。客户实际部署的镜像环境（4C8G + 5Mbps）中，OpenCLI 的 COOKIE 策略（大部分企业系统）7-12s 返回，用户体验可接受。
 
----
-
 ## 七、整体架构
 
-OpenClaw 作为主 Agent 接收用户指令，优先用 OpenCLI 执行（快、稳、无 LLM 成本），不行就降级到 waiy-browser-page（LLM 辅助按步操作），最后兜底用 waiy-browser-agent（全自主）。云侧有个服务负责生成和维护 CLI 适配器。
+主 Agent 接收用户指令，优先用 OpenCLI 执行（快、稳、无 LLM 成本），不行就降级到 waiy-browser-page（LLM 辅助按步操作），最后兜底用 waiy-browser-agent（全自主）。云侧有个服务负责生成和维护 CLI 适配器。
+
+实际部署有两种模式：客户使用镜像环境中预装的主 Agent，或客户使用自有 Agent 对接 OpenCLI。
+
+### 7.1 模式 A：镜像环境部署（更常见）
+
+客户使用我们提供的镜像环境，主 Agent、OpenCLI、waiy-browser 全部预装在镜像中，开箱即用。
 
 ```plantuml
 @startuml
@@ -382,13 +468,12 @@ skinparam componentStyle rectangle
 skinparam backgroundColor #FEFEFE
 
 actor "客户用户" as User
-actor "研发" as Dev
 
-package "客户侧" {
-  [OpenClaw\n(主 Agent)] as CC
-  [OpenCLI\n(Node 运行时)] as OC
+package "镜像环境（4C8G 沙箱）" {
+  [主 Agent\n(OpenClaw，预装)] as CC
+  [OpenCLI\n(Node 运行时，预装)] as OC
 
-  package "waiy-browser 技能栈" {
+  package "waiy-browser 技能栈（预装）" {
     [waiy-browser-page\n(中层：LLM 辅助)] as BP
     [waiy-browser-agent\n(高层：全自主)] as BA
     [waiy-browser\n(底层：执行基座)] as BW
@@ -397,6 +482,9 @@ package "客户侧" {
     BA --> BW : 内部调用
   }
 
+  [office-automation Skill\n(.claude/skills/)] as Skill
+
+  CC --> Skill : 读取可用命令
   CC --> OC : 优先调用\n(0.5-10s)
   CC --> BP : 降级 1：分步操作\n(10-40s)
   CC --> BA : 降级 2：复杂任务\n(30-180s)
@@ -419,6 +507,67 @@ cloud "客户 Web 系统" {
 }
 
 User --> CC : "帮我查明天的会议室"
+Repo --> OC : 推送 CLI 更新\n+ Skill 更新
+OC --> WebSys : COOKIE/HEADER
+BP --> WebSys : CDP 操作
+BA --> WebSys : CDP 操作
+Chrome --> WebSys : debug 账号登录
+
+@enduml
+```
+
+**特点**：
+- 客户不需要自己搭环境，镜像里全部就绪
+- OpenCLI 适配器和 Skill 通过 Git 推送到镜像中更新
+- 主 Agent 预配置好 `office-automation` Skill
+- 适合大部分客户场景
+
+### 7.2 模式 B：客户自有 Agent 对接
+
+客户已有自己的 Agent 框架（或使用其他 LLM Agent），通过调用 OpenCLI 命令和 waiy-browser 技能栈对接。
+
+```plantuml
+@startuml
+skinparam componentStyle rectangle
+skinparam backgroundColor #FEFEFE
+
+actor "客户用户" as User
+
+package "客户侧" {
+  [客户自有 Agent] as CA
+  [OpenCLI\n(Node 运行时)] as OC
+
+  package "waiy-browser 技能栈" {
+    [waiy-browser-page\n(中层：LLM 辅助)] as BP
+    [waiy-browser-agent\n(高层：全自主)] as BA
+    [waiy-browser\n(底层：执行基座)] as BW
+
+    BP --> BW : 内部调用
+    BA --> BW : 内部调用
+  }
+
+  CA --> OC : 调用 opencli 命令\n(Bash / HTTP API)
+  CA --> BP : 降级 1
+  CA --> BA : 降级 2
+}
+
+package "云侧（维护）" {
+  [CLI 生成服务] as Factory
+  [巡检服务] as Patrol
+  database "Skill 仓库" as Repo
+  [Chrome] as Chrome
+
+  Factory --> Chrome : CDP
+  Patrol --> Chrome : CDP
+  Factory --> Repo : 发布新 CLI
+  Patrol --> Factory : 失效→修复
+}
+
+cloud "客户 Web 系统" {
+  [OA/ERP/企微...] as WebSys
+}
+
+User --> CA : 自然语言指令
 Repo --> OC : 推送 CLI 更新
 OC --> WebSys : COOKIE/HEADER
 BP --> WebSys : CDP 操作
@@ -428,11 +577,15 @@ Chrome --> WebSys : debug 账号登录
 @enduml
 ```
 
----
+**特点**：
+- 客户自己维护 Agent，我们只提供 OpenCLI + waiy-browser 作为工具层
+- 客户需要自己实现降级逻辑（参考 `office-automation` Skill 的规则）
+- OpenCLI 可通过 Bash 调用或 HTTP daemon（`:19825`）对接
+- 适合有技术能力、已有 Agent 框架的客户
 
 ## 八、交付形式
 
-交付给客户的是一个 **OpenClaw 的 Skill 文件**（`.claude/skills/office-automation.md`），告诉 OpenClaw 有哪些命令可用、怎么用、什么时候降级：
+交付给客户的是一个 **Skill 文件**（`.claude/skills/office-automation.md`），告诉主 Agent 有哪些命令可用、怎么用、什么时候降级：
 
 ```markdown
 # office-automation skill
@@ -468,8 +621,6 @@ Chrome --> WebSys : debug 账号登录
 
 这个 Skill 不是一次性写完的——每录制一个新的 CLI 适配器，就在 Skill 里增加对应的命令说明。
 
----
-
 ## 九、客户接入的完整过程
 
 以"阿里会议室预订查询"为例（`https://meeting.alibaba-inc.com/alimeeting/web#/`）：
@@ -480,7 +631,7 @@ Chrome --> WebSys : debug 账号登录
 
 **第二步：生成 CLI 适配器（2-4 小时/个系统）**
 
-这是**录制阶段**。在 OpenClaw 里加载 `opencli-adapter-author` skill，让 Agent 驱动整个过程：
+这是**录制阶段**，全程使用工具链 A（opencli browser *）。在 OpenClaw 里加载 `opencli-adapter-author` skill，让 Agent 驱动整个过程：
 
 ```bash
 # 1. 分析站点结构，推荐认证策略
@@ -504,7 +655,7 @@ opencli browser network capture-read -f json
 # 5. Agent 分析 API 结构，生成适配器骨架
 opencli browser init alimeeting/rooms
 
-# 6. Agent 编写适配器代码（见第二章适配器结构）
+# 6. Agent 编写适配器代码（见 2.2 节适配器结构）
 ```
 
 **第三步：验证（30 分钟）**
@@ -540,15 +691,13 @@ opencli plugin update alimeeting
 
 **第六步：用户使用（回放阶段）**
 
-用户在 OpenClaw 里说"帮我查下明天 3 楼有哪些会议室可以用"，OpenClaw 读到 Skill 后调用：
+用户说"帮我查下明天 3 楼有哪些会议室可以用"，主 Agent 读到 Skill 后调用：
 
 ```bash
 opencli alimeeting rooms --date 2026-06-15 --floor 3F -f json
 ```
 
-5-8 秒返回结果。如果用户说"帮我预订明天下午 2 点 3 楼的 302 会议室"，而还没有 `alimeeting book` 这个 CLI，OpenClaw 降级——流程简单就用 `waiy-browser-page` 分步操作（navigate → act "点击 302 会议室" → act "选择 14:00" → act "确认预订"），流程复杂就交给 `waiy-browser-agent execute_task` 全自主完成。
-
----
+5-8 秒返回结果。如果用户说"帮我预订明天下午 2 点 3 楼的 302 会议室"，而还没有 `alimeeting book` 这个 CLI，主 Agent 降级到工具链 B——流程简单就用 `waiy-browser-page` 分步操作（navigate → act "点击 302 会议室" → act "选择 14:00" → act "确认预订"），流程复杂就交给 `waiy-browser-agent execute_task` 全自主完成。
 
 ## 十、CLI 全生命周期管理
 
@@ -657,8 +806,6 @@ done
 | 文件同步（rsync/scp） | 简单直接 | 运维操作，用户无感 |
 | 包分发（npm private registry） | 多客户统一管理 | `npm update @customer/opencli-skills` |
 
----
-
 ## 十一、云侧 CLI 生成服务
 
 ### 11.1 Chrome 实例与 debug 账号
@@ -688,8 +835,6 @@ Chrome 实例
 - `opencli browser state` 查看页面元素（带编号），`opencli browser click "[3]"` 精确点击——确定性操作，不依赖 LLM 看截图判断。
 - 总耗时：30 分钟-2 小时/个 API（取决于 API 复杂度和认证方式）。
 
----
-
 ## 十二、与现有代码的对应关系
 
 | 架构组件 | 现有代码 | 状态 |
@@ -710,8 +855,6 @@ Chrome 实例
 | Skill 推送分发 | 无 | ❌ 待建 |
 | 客户 Skill 配置 | `.claude/skills/` 框架已有 | 🟡 需定制 |
 
----
-
 ## 十三、客户接入 checklist
 
 | 步骤 | 耗时 | 产出 | 谁做 |
@@ -724,8 +867,6 @@ Chrome 实例
 | 6. 部署到客户端 | 半天 | OpenCLI + Skill 在客户环境跑通 | 研发 + 客户 IT |
 | 7. 配置巡检 | 1 小时 | 定时任务 | 研发 |
 | **总计** | **4-6 天** | 可用的数字员工 | |
-
----
 
 ## 十四、MVP 建议
 
