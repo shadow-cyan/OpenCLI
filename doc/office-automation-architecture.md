@@ -314,51 +314,26 @@ end note
 
 客户日常使用时，主 Agent 按以下优先级执行用户指令。**站点地图在降级时起关键作用**——Agent 读取 sitemap 知道该去哪个页面、走什么路径、避开什么坑，不需要从零探索。
 
-```plantuml
-@startuml
-skinparam activityShape roundedBox
+```mermaid
+flowchart TD
+    A[用户发起指令] --> B{有匹配的 opencli 命令?}
+    B -->|是| C[opencli 执行<br>0.5-10s，无 LLM]
+    C --> D{成功?}
+    D -->|是| E[返回结构化数据]
+    D -->|否| F[记录失败，上报巡检]
+    B -->|否| G
 
-start
-:用户发起指令;
+    F --> G[读取站点地图<br>获取页面结构、操作路径、已知坑]
+    G --> H{有 sitemap + 流程清晰?}
+    H -->|是| I[参考 sitemap<br>waiy-browser-page 分步执行<br>10-40s，每步调 LLM]
+    I --> J{成功?}
+    J -->|是| K[返回结果，记录执行轨迹]
+    J -->|否| L
+    H -->|否| L
 
-:主 Agent 解析意图;
-
-if (有匹配的 opencli 命令?) then (是)
-  :opencli 执行\n(0.5-10s，无 LLM);
-  if (成功?) then (是)
-    :返回结构化数据;
-    stop
-  else (否)
-    :记录失败\n上报巡检;
-  endif
-else (否)
-endif
-
-:读取站点地图（如有）\n获取页面结构、操作路径、已知坑;
-
-if (有 sitemap + 流程清晰?) then (是)
-  :参考 sitemap\nwaiy-browser-page 分步执行\n(10-40s，每步调 LLM);
-  if (成功?) then (是)
-    :返回结果;
-    :记录执行轨迹;
-    stop
-  else (否)
-    :分步操作失败;
-  endif
-else (否)
-endif
-
-:waiy-browser-agent 全自主执行\n(30-180s，内置 Agent);
-if (成功?) then (是)
-  :返回结果;
-  :记录执行轨迹;
-else (否)
-  :请求人工介入;
-endif
-
-stop
-
-@enduml
+    L[waiy-browser-agent 全自主执行<br>30-180s，内置 Agent] --> M{成功?}
+    M -->|是| N[返回结果，记录执行轨迹]
+    M -->|否| O[请求人工介入]
 ```
 
 ### 5.1 三级降级对照
