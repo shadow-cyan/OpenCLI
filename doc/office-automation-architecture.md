@@ -1,6 +1,6 @@
 # 办公自动化平台架构设计
 
-> 基于 OpenCLI + waiy-browser + 主 Agent（OpenClaw）的企业办公自动化方案。
+基于 OpenCLI + waiy-browser + 主 Agent（OpenClaw）的企业办公自动化方案。
 
 ## 一、目标与范围
 
@@ -303,8 +303,6 @@ end note
 | **产出** | 站点技能包（适配器 + 站点地图 + 回归基准）+ Skill | 健康报告 / 修复 patch | 结构化数据 |
 | **耗时** | 30min-2h / 个 API | 巡检 <1min/命令；修复 1min-4h | 0.5-10s / 次 |
 
-> **录制阶段不一定需要研发**。用户也可以在 OpenClaw 里加载 `opencli-adapter-author` skill，让 Agent 帮你录制。但企业内网系统（OA/ERP）的 API 认证通常比较复杂，建议研发先做，后续简单站点用户可以自助。
-
 ### 4.1 巡检具体做什么
 
 1. **每天**：定时任务跑 `opencli validate <site>` 校验适配器定义 + 对每个命令执行一次（取前 3 条数据），确认接口可达、返回非空
@@ -374,7 +372,7 @@ stop
 | 控制粒度 | 精确（参数化 CLI） | 中（调用者分步控制） | 低（只给目标，Agent 自主） |
 | 适用场景 | 高频、重复、结构化 | 流程清晰的降级操作 | 复杂/不确定的一次性操作 |
 
-> **底层 `waiy-browser`** 不出现在降级链中——它的 `snapshot` 返回临时元素编号，无法在无人值守场景下独立工作。但它是 page 和 agent 层的执行引擎，间接参与所有降级操作。
+底层 `waiy-browser` 不出现在降级链中——它的 `snapshot` 返回临时元素编号，无法在无人值守场景下独立工作。但它是 page 和 agent 层的执行引擎，间接参与所有降级操作。
 
 ### 5.2 降级示例
 
@@ -475,7 +473,7 @@ stop
 | 适配器校验 | `opencli validate npm` | **0.35s** | ~0.30s | ✅ 3 命令全通过 |
 | 适配器校验 | `opencli validate pypi` | **0.35s** | ~0.30s | ✅ 2 命令全通过 |
 
-> \* 本地推算基于 Apple M2 Pro 32G + 100Mbps 网络环境。PUBLIC 策略主要耗时在网络延迟（API 请求），本地 100Mbps 网络的 RTT 通常比沙箱 5Mbps 低 50-60%。
+\* 本地推算基于 Apple M2 Pro 32G + 100Mbps 网络环境。PUBLIC 策略主要耗时在网络延迟（API 请求），本地 100Mbps 网络的 RTT 通常比沙箱 5Mbps 低 50-60%。
 
 ### 6.2 各执行方式耗时对照
 
@@ -719,229 +717,7 @@ Skill 文件是站点技能包的"索引"——告诉主 Agent 有哪些命令�
 
 站点技能包不是一次性写完的——每录制一个新的 CLI 适配器，对应站点的技能包就多一个文件，Skill 文件里增加一条命令说明。新站点接入时，新建一个站点技能包目录。整个过程由主 Agent 在录制阶段自动完成（提交 Git + 上传 OSS 分发）。
 
-## 九、客户接入的完整过程
-
-以"阿里会议室预订查询"为例（`https://meeting.alibaba-inc.com/alimeeting/web#/`）：
-
-**第一步：拿到 debug 账号（1 天）**
-
-客户提供阿里内网会议系统的 debug 账号。在云侧 Chrome 里登录，确认能访问会议室页面。
-
-**第二步：生成 CLI 适配器（2-4 小时/个系统）**
-
-这是**录制阶段**，全程使用工具链 A（opencli browser *）。在 OpenClaw 里加载 `opencli-adapter-author` skill，让 Agent 驱动整个过程：
-
-```bash
-# 1. 分析站点结构，推荐认证策略
-opencli browser analyze "https://meeting.alibaba-inc.com/alimeeting/web#/" \
-    --trace on --keep-tab true --window foreground
-# 输出：Pattern B（SPA + 内部 API），推荐 COOKIE_API 策略
-
-# 2. 抓包
-opencli browser network capture-start
-
-# 3. Agent 通过 opencli browser state 拿到页面元素编号，精确操作
-opencli browser state
-# 输出：[1] 日期选择器  [2] 楼层下拉  [3] 查询按钮  ...
-opencli browser click "[3]"
-# <1s，确定性操作
-
-# 4. 读取网络请求，发现 API
-opencli browser network capture-read -f json
-# 输出：发现 GET /api/meeting/room/list?date=...&floor=... 返回 JSON
-
-# 5. Agent 分析 API 结构，生成适配器骨架
-opencli browser init alimeeting/rooms
-
-# 6. Agent 编写适配器代码（见 2.2 节适配器结构）
-```
-
-**第三步：验证（30 分钟）**
-
-```bash
-# 校验适配器定义是否合法
-opencli validate alimeeting
-# ✅ PASS, 1 command(s), Errors: 0
-
-# 用真实 Cookie 执行一次，核对返回数据与页面一致
-opencli alimeeting rooms --date 2026-06-15 --floor 3F
-# ✅ 返回会议室列表
-
-# 生成回归基准
-opencli browser verify alimeeting rooms --write-fixture
-# ✅ 写入 ~/.opencli/sites/alimeeting/verify/rooms.json
-```
-
-**第四步：提交并分发站点技能包**
-
-主 Agent 在沙箱内提交到本地 Git（版本管理），然后上传到 OSS 供其他镜像拉取。这是 `opencli-adapter-author` skill runbook 的最后一步。
-
-```bash
-# 主 Agent 提交站点技能包到本地 Git
-git add clis/alimeeting/ sitemaps/alimeeting/ verify/alimeeting/
-git commit -m "feat(alimeeting): add room query skill package"
-
-# 上传到 OSS（其他镜像从 OSS 拉取更新）
-```
-
-**第六步：用户使用（回放阶段）**
-
-用户说"帮我查下明天 3 楼有哪些会议室可以用"，主 Agent 读到 Skill 后调用：
-
-```bash
-opencli alimeeting rooms --date 2026-06-15 --floor 3F -f json
-```
-
-5-8 秒返回结果。如果用户说"帮我预订明天下午 2 点 3 楼的 302 会议室"，而还没有 `alimeeting book` 这个 CLI，主 Agent 降级到工具链 B——流程简单就用 `waiy-browser-page` 分步操作（navigate → act "点击 302 会议室" → act "选择 14:00" → act "确认预订"），流程复杂就交给 `waiy-browser-agent execute_task` 全自主完成。
-
-## 十、CLI 全生命周期管理
-
-不是生成一次就完事，持续维护是核心壁垒。
-
-### 10.1 生命周期状态图
-
-```plantuml
-@startuml
-skinparam backgroundColor #FEFEFE
-
-[*] --> 生成 : 客户接入
-生成 --> 运行 : 验证通过
-运行 --> 巡检 : 持续监控
-巡检 --> 运行 : ✅ 健康
-巡检 --> 修复 : ❌ 失效
-修复 --> 运行 : 修复后重新发布
-运行 --> [*] : 客户下线
-
-@enduml
-```
-
-### 10.2 生成阶段
-
-**谁来做**：OpenClaw（研发或用户均可）驱动 `opencli browser *` 系列命令。
-
-**耗时预估**：
-
-| 场景 | 耗时 | 说明 |
-|------|------|------|
-| 一个 API 接口的 CLI | 30 分钟-2 小时 | API 清晰、认证简单（COOKIE） |
-| 一个系统的全部 CLI（10-30 个接口） | 1-2 天 | 包括 API 发现、认证分析、全部适配器编写和验证 |
-| 一个客户的全部系统（3-5 个系统） | 4-6 天 | 包括账号对接、各系统 CLI 生成、整体验证 |
-
-**常见的坑**：
-
-| 问题 | 表现 | 解决办法 |
-|----|------|---------|
-| API 有签名参数 | 直接 fetch 返回 403 | 用 INTERCEPT 策略拦截请求 |
-| 登录态频繁过期 | CLI 跑了几小时后 401 | 定时刷新 Cookie（每 4 小时访问一次页面） |
-| 前端渲染无 API | Network 里全是静态资源，没有 JSON | 降级为 UI 策略（DOM 提取），或用 waiy-browser-page |
-| CSRF Token 在 meta 标签里 | fetch 需要额外 header | HEADER 策略，先提取 Token 再 fetch |
-| 分页逻辑不统一 | 有的是 page/size，有的是 cursor | 适配器里逐个处理，无法统一 |
-
-### 10.3 巡检阶段
-
-**谁来做**：定时任务，自动运行。
-
-```bash
-#!/bin/bash
-# patrol.sh — 每日巡检脚本
-SITES="alimeeting kingdee oa-system"
-
-for site in $SITES; do
-    # 1. 校验定义
-    result=$(opencli validate $site 2>&1)
-    if [ $? -ne 0 ]; then
-        echo "❌ $site validate failed: $result"
-        continue
-    fi
-
-    # 2. 执行一次（取前 3 条验证能跑通）
-    commands=$(opencli $site --help 2>&1 | grep -oP '^\s+\K\w+(?=\s)')
-    for cmd in $commands; do
-        result=$(timeout 30 opencli $site $cmd --limit 3 -f json 2>&1)
-        exit_code=$?
-        if [ $exit_code -ne 0 ]; then
-            echo "❌ $site $cmd failed (exit=$exit_code): $result"
-            # 触发 opencli-autofix skill
-        else
-            echo "✅ $site $cmd OK"
-        fi
-    done
-done
-```
-
-**频率建议**：
-
-| 巡检项 | 频率 | 理由 |
-|--------|------|------|
-| 接口可达性（能不能跑通） | 每天 | 登录态过期、接口下线都能及时发现 |
-| 数据结构一致性（返回字段有没有变） | 每周 | 字段变化通常伴随版本发布，不会每天变 |
-| 全量回归（所有命令 + 参数组合） | 每月 | 全面但耗时，低频即可 |
-
-### 10.4 修复阶段
-
-**修复过程**：
-
-1. **诊断**：登录态过期（401）？API 路径变了（404）？参数变了（400）？数据结构变了（字段缺失）？
-2. **自动修复**：登录态过期 → 重新登录刷新 Cookie；数据结构变化 → 重新抓包更新 `columns` 和 `map`
-3. **半自动修复**：API 路径变了 → OpenClaw 重新探索页面，发现新 API，更新适配器
-4. **人工修复**：整个前端重构 → 重新走一遍生成流程
-
-| 问题类型 | 修复耗时 | 自动化程度 |
-|---------|---------|-----------|
-| 登录态过期 | 1 分钟 | 全自动 |
-| 字段名变化 | 10-30 分钟 | 半自动（Agent 辅助） |
-| API 路径变化 | 30 分钟-1 小时 | 半自动 |
-| 前端重构 | 2-4 小时 | 手动 + Agent |
-
-### 10.5 推送阶段
-
-站点技能包在沙箱内录制完成后，主 Agent 提交到本地 Git（版本管理），然后上传到 OSS 分发：
-
-```
-沙箱内：Agent git commit → 上传到 OSS
-                                ↓
-其他镜像 ← 启动时或定时从 OSS 拉取最新站点技能包 + Skill 文件
-```
-
-| 同步时机 | 说明 |
-|---------|------|
-| 镜像启动时 | 自动从 OSS 拉取最新版本，确保每次启动都是最新 |
-| 定时同步 | 每小时检查一次 OSS 是否有更新 |
-| 手动触发 | `opencli plugin update` |
-
-## 十一、镜像内的生成与维护服务
-
-CLI 生成和巡检服务都运行在客户镜像内，不依赖云侧。
-
-### 11.1 Chrome 实例与 debug 账号
-
-客户给一个 debug 账号，镜像内维护一个 Chrome 实例：
-
-```
-Chrome 实例
-├── Profile: customer-A
-│   ├── Tab 1: 阿里会议 (已登录)
-│   ├── Tab 2: 金蝶 ERP (已登录)
-│   └── Tab 3: OA 系统 (已登录)
-└── Cookie Store: encrypted at rest
-```
-
-**登录态管理**：
-
-| 问题 | 方案 | 频率 |
-|------|------|------|
-| Session 过期 | 定时访问目标页面，刷新 Cookie | 每 4 小时 |
-| Cookie 过期 | 用账号密码重新登录 | 按需（告警触发） |
-| 验证码/短信 | 通知研发手动处理 | 极少（debug 账号通常免验证码） |
-
-### 11.2 生成流程补充
-
-- 整个录制过程在镜像内完成。Agent 加载 `opencli-adapter-author` skill 后，按 SKILL.md 里的决策树 + runbook 自动执行 `opencli browser *` 命令。研发的角色是发起任务 + review 产出。
-- `opencli browser state` 查看页面元素（带编号），`opencli browser click "[3]"` 精确点击——确定性操作，不依赖 LLM 看截图判断。
-- 总耗时：30 分钟-2 小时/个 API（取决于 API 复杂度和认证方式）。
-- 生成的站点技能包由主 Agent 提交到本地 Git（版本管理），然后上传到 OSS 供其他镜像拉取。
-
-## 十二、与现有代码的对应关系
+## 九、与现有代码的对应关系
 
 | 架构组件 | 现有代码 | 状态 |
 |---------|---------|------|
@@ -961,7 +737,7 @@ Chrome 实例
 | 站点技能包分发（OSS） | 无 | ❌ 待建 |
 | 客户 Skill 文件 | `.claude/skills/` 框架已有 | 🟡 需定制 |
 
-## 十三、客户接入 checklist
+## 十、客户接入 checklist
 
 | 步骤 | 耗时 | 产出 | 谁做 |
 |------|------|------|------|
@@ -974,7 +750,7 @@ Chrome 实例
 | 7. 配置巡检 | 1 小时 | 定时任务 | 研发 |
 | **总计** | **4-6 天** | 可用的数字员工 | |
 
-## 十四、MVP 建议
+## 十一、MVP 建议
 
 第一个客户的第一个场景："阿里会议室查询 + 预订"。
 
