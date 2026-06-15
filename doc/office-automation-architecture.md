@@ -44,11 +44,11 @@
 
 | | 读（查询/提取） | 写（提交/操作） |
 |---|---|---|
-| **OpenCLI 能覆盖** | `func` 里调 API 返回数据 | `pipeline` 里 navigate + evaluate（调提交 API） |
+| **OpenCLI 能覆盖** | 适配器直接调查询 API，返回结构化数据 | 适配器打开页面后调提交 API（POST/PUT） |
 | **OpenCLI 不能覆盖** | 降级到 `waiy-browser-page page_use_extract` | 降级到 `waiy-browser-page page_use_act` |
 | **流程太复杂** | 降级到 `waiy-browser-agent execute_task` | 降级到 `waiy-browser-agent execute_task` |
 
-OpenCLI 不只是"读"。适配器的 `pipeline` 可以执行任意浏览器内操作（包括表单填写和提交），只要 API 存在就能封装。区别在于：读操作通常对应 GET 请求，写操作对应 POST/PUT 请求——但对 OpenCLI 来说都是 `fetch`。
+OpenCLI 不只是"读"。适配器可以封装任意 HTTP 请求（GET 查询、POST 提交、PUT 更新），只要背后有 API 就能做。读和写对 OpenCLI 来说都是 `fetch`，区别只是请求方法不同。
 
 ## 二、工具与技能全景
 
