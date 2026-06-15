@@ -686,14 +686,16 @@ opencli browser verify alimeeting rooms --write-fixture
 # ✅ 写入 ~/.opencli/sites/alimeeting/verify/rooms.json
 ```
 
-**第四步：上传到 OSS 分发（自动/手动）**
+**第四步：提交并分发**
+
+主 Agent 在沙箱内提交到本地 Git（版本管理），然后上传到 OSS 供其他镜像拉取。这是 `opencli-adapter-author` skill runbook 的最后一步。
 
 ```bash
-# 在沙箱内，将适配器和 Skill 上传到 OSS
-ossutil cp -r clis/alimeeting/ oss://office-automation/adapters/alimeeting/
-ossutil cp .claude/skills/office-automation.md oss://office-automation/skills/
+# 主 Agent 提交到本地 Git
+git add clis/alimeeting/
+git commit -m "feat(alimeeting): add room query CLI"
 
-# 其他镜像启动时或定时自动从 OSS 拉取
+# 上传到 OSS（其他镜像从 OSS 拉取更新）
 ```
 
 **第六步：用户使用（回放阶段）**
@@ -807,19 +809,19 @@ done
 
 ### 10.5 推送阶段
 
-适配器在沙箱内录制完成后，上传到 OSS，其他镜像从 OSS 拉取更新：
+适配器在沙箱内录制完成后，主 Agent 提交到本地 Git（版本管理），然后上传到 OSS 分发：
 
 ```
-沙箱 A（录制） → ossutil cp clis/alimeeting/ oss://bucket/adapters/
-                                    ↓
-沙箱 B/C/D（使用） ← 启动时或定时从 OSS 拉取最新适配器 + Skill
+沙箱内：Agent git commit → 上传到 OSS
+                                ↓
+其他镜像 ← 启动时或定时从 OSS 拉取最新适配器 + Skill
 ```
 
 | 同步时机 | 说明 |
 |---------|------|
 | 镜像启动时 | 自动从 OSS 拉取最新版本，确保每次启动都是最新 |
 | 定时同步 | 每小时检查一次 OSS 是否有更新 |
-| 手动触发 | `opencli plugin update`（从 OSS 拉取） |
+| 手动触发 | `opencli plugin update` |
 
 ## 十一、镜像内的生成与维护服务
 
@@ -851,7 +853,7 @@ Chrome 实例
 - 整个录制过程在镜像内完成。Agent 加载 `opencli-adapter-author` skill 后，按 SKILL.md 里的决策树 + runbook 自动执行 `opencli browser *` 命令。研发的角色是发起任务 + review 产出。
 - `opencli browser state` 查看页面元素（带编号），`opencli browser click "[3]"` 精确点击——确定性操作，不依赖 LLM 看截图判断。
 - 总耗时：30 分钟-2 小时/个 API（取决于 API 复杂度和认证方式）。
-- 生成的适配器上传到 OSS，其他客户镜像从 OSS 拉取更新。
+- 生成的适配器由主 Agent 提交到本地 Git（版本管理），然后上传到 OSS 供其他镜像拉取。
 
 ## 十二、与现有代码的对应关系
 
