@@ -456,7 +456,7 @@ OpenCLI 比 waiy-browser-page 快一个数量级，比 waiy-browser-agent 快两
 
 主 Agent 接收用户指令，优先用 OpenCLI 执行（快、稳、无 LLM 成本），不行就降级到 waiy-browser-page（LLM 辅助按步操作），最后兜底用 waiy-browser-agent（全自主）。
 
-**除主 Agent 外的所有组件（OpenCLI、waiy-browser、巡检服务、CLI 生成能力、Chrome 实例）都打包在镜像中交付给客户**，自包含运行。云侧只保留 Skill 仓库（Git）用于版本管理和多客户分发。
+**除主 Agent 外的所有组件（OpenCLI、waiy-browser、巡检服务、CLI 生成能力、Chrome 实例）都打包在镜像中交付给客户**，自包含运行。适配器和 Skill 的多客户分发通过 OSS（阿里云对象存储）：沙箱内录制完成后上传到 OSS，其他镜像从 OSS 拉取更新。
 
 实际部署有两种模式：客户使用镜像环境中预装的主 Agent，或客户使用自有 Agent 对接。
 
@@ -503,14 +503,15 @@ package "镜像环境（4C8G 沙箱）" {
   Factory --> OC : 生成适配器
 }
 
-database "Skill 仓库\n(Git，云侧)" as Repo
+cloud "OSS\n(阿里云对象存储)" as OSS
 
 cloud "客户 Web 系统" {
   [OA/ERP/企微...] as WebSys
 }
 
 User --> CC : "帮我查明天的会议室"
-Repo --> Skill : 版本同步\n+ 多客户分发
+Factory ..> OSS : 录制完成后\n上传适配器 + Skill
+OSS ..> Skill : 其他镜像\n拉取更新
 OC --> WebSys : COOKIE/HEADER
 BP --> WebSys : CDP 操作
 BA --> WebSys : CDP 操作
@@ -522,8 +523,7 @@ Chrome --> WebSys : debug 账号登录
 **特点**：
 - 客户不需要自己搭环境，镜像里全部就绪（包括 CLI 生成和巡检能力）
 - 镜像内的 Chrome 实例维护 debug 账号登录态，巡检定时任务自动运行
-- 新增 CLI 适配器可以在镜像内完成录制、验证、发布全流程
-- Skill 仓库（Git）是唯一的云侧组件，用于版本管理和多客户分发
+- 新增 CLI 适配器在镜像内完成录制、验证后，上传到 OSS 分发给其他镜像
 - 适合大部分客户场景
 
 ### 7.2 模式 B：客户自有 Agent 对接
@@ -570,14 +570,15 @@ package "客户环境" {
   CA --> BA : 降级 2
 }
 
-database "Skill 仓库\n(Git，云侧)" as Repo
+cloud "OSS\n(阿里云对象存储)" as OSS
 
 cloud "客户 Web 系统" {
   [OA/ERP/企微...] as WebSys
 }
 
 User --> CA : 自然语言指令
-Repo --> OC : 版本同步
+Factory ..> OSS : 上传适配器
+OSS ..> OC : 拉取更新
 OC --> WebSys : COOKIE/HEADER
 BP --> WebSys : CDP 操作
 BA --> WebSys : CDP 操作
@@ -590,7 +591,8 @@ Chrome --> WebSys : debug 账号登录
 - 客户自己维护 Agent，我们提供 OpenCLI + waiy-browser + 巡检 + CLI 生成能力作为工具层
 - 客户需要自己实现降级逻辑（参考 `office-automation` Skill 的规则）
 - OpenCLI 可通过 Bash 调用或 HTTP daemon（`:19825`）对接
-- 巡检和 CLI 生成同样在客户环境内运行，不依赖云侧
+- 巡检和 CLI 生成同样在客户环境内运行
+- 适配器更新通过 OSS 分发
 - 适合有技术能力、已有 Agent 框架的客户
 
 ## 八、交付形式
@@ -684,19 +686,14 @@ opencli browser verify alimeeting rooms --write-fixture
 # ✅ 写入 ~/.opencli/sites/alimeeting/verify/rooms.json
 ```
 
-**第四步：发布到 Skill 仓库（自动）**
+**第四步：上传到 OSS 分发（自动/手动）**
 
 ```bash
-git add clis/alimeeting/
-git commit -m "feat(alimeeting): add room query CLI"
-git push
-```
+# 在沙箱内，将适配器和 Skill 上传到 OSS
+ossutil cp -r clis/alimeeting/ oss://office-automation/adapters/alimeeting/
+ossutil cp .claude/skills/office-automation.md oss://office-automation/skills/
 
-**第五步：推送到客户端（自动/手动）**
-
-```bash
-opencli plugin update alimeeting
-# 或 rsync/scp 增量推送
+# 其他镜像启动时或定时自动从 OSS 拉取
 ```
 
 **第六步：用户使用（回放阶段）**
@@ -810,13 +807,19 @@ done
 
 ### 10.5 推送阶段
 
-适配器和 Skill 更新需要从 Skill 仓库同步到客户镜像：
+适配器在沙箱内录制完成后，上传到 OSS，其他镜像从 OSS 拉取更新：
 
-| 方式 | 适用场景 | 客户体验 |
-|------|---------|---------|
-| Git pull | 镜像内直接拉取 | `opencli plugin update` 一键更新 |
-| OSS 分发（阿里云） | 多客户统一管理 | 镜像启动时自动拉取最新版本 |
-| 文件同步（rsync/scp） | 简单直接 | 运维操作，用户无感 |
+```
+沙箱 A（录制） → ossutil cp clis/alimeeting/ oss://bucket/adapters/
+                                    ↓
+沙箱 B/C/D（使用） ← 启动时或定时从 OSS 拉取最新适配器 + Skill
+```
+
+| 同步时机 | 说明 |
+|---------|------|
+| 镜像启动时 | 自动从 OSS 拉取最新版本，确保每次启动都是最新 |
+| 定时同步 | 每小时检查一次 OSS 是否有更新 |
+| 手动触发 | `opencli plugin update`（从 OSS 拉取） |
 
 ## 十一、镜像内的生成与维护服务
 
@@ -848,7 +851,7 @@ Chrome 实例
 - 整个录制过程在镜像内完成。Agent 加载 `opencli-adapter-author` skill 后，按 SKILL.md 里的决策树 + runbook 自动执行 `opencli browser *` 命令。研发的角色是发起任务 + review 产出。
 - `opencli browser state` 查看页面元素（带编号），`opencli browser click "[3]"` 精确点击——确定性操作，不依赖 LLM 看截图判断。
 - 总耗时：30 分钟-2 小时/个 API（取决于 API 复杂度和认证方式）。
-- 生成的适配器提交到 Skill 仓库（Git），通过 OSS 或 Git pull 同步到其他客户镜像。
+- 生成的适配器上传到 OSS，其他客户镜像从 OSS 拉取更新。
 
 ## 十二、与现有代码的对应关系
 
@@ -867,7 +870,7 @@ Chrome 实例
 | 结构化提取+翻页 | `browser_use/page/extractor.py` → `PageExtractor` | ✅ 已有 |
 | 巡检服务 | 需要新建（定时任务 + shell 脚本） | ❌ 待建 |
 | 登录态管理 | 部分有（OpenCLI Cookie 策略） | 🟡 需扩展 |
-| Skill 推送分发 | 无 | ❌ 待建 |
+| Skill 推送分发（OSS） | 无 | ❌ 待建 |
 | 客户 Skill 配置 | `.claude/skills/` 框架已有 | 🟡 需定制 |
 
 ## 十三、客户接入 checklist
