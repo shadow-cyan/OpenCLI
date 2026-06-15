@@ -44,13 +44,15 @@
 
 **用高级 Agent 借助 OpenCLI 预先生成结构化产物，客户侧 Agent 消费这些产物来高效完成网站操作。**
 
-录制阶段产出的不止是 CLI 适配器，而是一组完整的**站点知识产物**：
+录制阶段产出的不止是 CLI 适配器，而是一组完整的**站点技能包**——每个站点一个包，包含该站点自动化所需的全部产物：
 
 | 产物 | 位置 | 内容 | 给谁用 |
 |------|------|------|--------|
 | **CLI 适配器** | `clis/<site>/<cmd>.js` | 参数化的 API 调用封装 | OpenCLI 执行引擎（确定性执行，最快） |
 | **站点地图** | `sitemaps/<site>/` | 页面结构、操作路径、已知坑 | 客户 Agent 降级操作时参考 |
-| **Skill 文件** | `.claude/skills/office-automation.md` | 可用命令清单 + 降级规则 | 客户 Agent 决策 |
+| **回归基准** | `verify/<site>/` | 巡检用的数据快照 | 巡检服务（检测字段变化） |
+
+所有站点技能包 + 一个跨站点的 **Skill 文件**（`.claude/skills/office-automation.md`，汇总所有站点的命令清单 + 降级规则）= 交付给客户的全部产物。
 
 以阿里会议室为例，录制产出的站点地图结构：
 
@@ -68,7 +70,7 @@ sitemaps/alimeeting/
 
 **站点地图的价值在降级时体现**：当客户 Agent 降级到 waiy-browser-page 操作网页时，它不需要从零探索——读 sitemap 就知道该去哪个页面、走什么路径、有什么坑要避开。这让降级操作更快、更可靠。
 
-三层产物形成**覆盖梯度**：
+站点技能包形成**覆盖梯度**：
 
 ```
 CLI 适配器存在 → 直接调 opencli（0.5-10s，100% 可靠）
@@ -298,7 +300,7 @@ end note
 | **用的 Skill** | `opencli-adapter-author` | `opencli-autofix`（失效时自动修复） | `office-automation` |
 | **工具链** | A（opencli browser *） | A（validate/verify） | opencli 优先，B（waiy-browser）降级 |
 | **需要浏览器** | 需要（探索 + 验证） | COOKIE/UI 策略需要 | 看 strategy |
-| **产出** | 适配器 + 站点地图 + Skill | 健康报告 / 修复 patch | 结构化数据 |
+| **产出** | 站点技能包（适配器 + 站点地图 + 回归基准）+ Skill | 健康报告 / 修复 patch | 结构化数据 |
 | **耗时** | 30min-2h / 个 API | 巡检 <1min/命令；修复 1min-4h | 0.5-10s / 次 |
 
 > **录制阶段不一定需要研发**。用户也可以在 OpenClaw 里加载 `opencli-adapter-author` skill，让 Agent 帮你录制。但企业内网系统（OA/ERP）的 API 认证通常比较复杂，建议研发先做，后续简单站点用户可以自助。
@@ -494,7 +496,7 @@ OpenCLI 比 waiy-browser-page 快一个数量级，比 waiy-browser-agent 快两
 
 主 Agent 接收用户指令，优先用 OpenCLI 执行（快、稳、无 LLM 成本），不行就降级到 waiy-browser-page（LLM 辅助按步操作），最后兜底用 waiy-browser-agent（全自主）。
 
-**除主 Agent 外的所有组件（OpenCLI、waiy-browser、巡检服务、CLI 生成能力、Chrome 实例）都打包在镜像中交付给客户**，自包含运行。适配器和 Skill 的多客户分发通过 OSS（阿里云对象存储）：沙箱内录制完成后上传到 OSS，其他镜像从 OSS 拉取更新。
+**除主 Agent 外的所有组件（OpenCLI、waiy-browser、巡检服务、CLI 生成能力、Chrome 实例）都打包在镜像中交付给客户**，自包含运行。站点技能包和 Skill 文件的多客户分发通过 OSS（阿里云对象存储）：沙箱内录制完成后上传到 OSS，其他镜像从 OSS 拉取更新。
 
 实际部署有两种模式：客户使用镜像环境中预装的主 Agent，或客户使用自有 Agent 对接。
 
@@ -548,7 +550,7 @@ cloud "客户 Web 系统" {
 }
 
 User --> CC : "帮我查明天的会议室"
-Factory ..> OSS : 录制完成后\n上传适配器 + Skill
+Factory ..> OSS : 录制完成后\n上传站点技能包
 OSS ..> Skill : 其他镜像\n拉取更新
 OC --> WebSys : COOKIE/HEADER
 BP --> WebSys : CDP 操作
@@ -561,7 +563,7 @@ Chrome --> WebSys : debug 账号登录
 **特点**：
 - 客户不需要自己搭环境，镜像里全部就绪（包括 CLI 生成和巡检能力）
 - 镜像内的 Chrome 实例维护 debug 账号登录态，巡检定时任务自动运行
-- 新增 CLI 适配器在镜像内完成录制、验证后，上传到 OSS 分发给其他镜像
+- 新增站点技能包在镜像内完成录制、验证后，上传到 OSS 分发给其他镜像
 - 适合大部分客户场景
 
 ### 7.2 模式 B：客户自有 Agent 对接
@@ -615,7 +617,7 @@ cloud "客户 Web 系统" {
 }
 
 User --> CA : 自然语言指令
-Factory ..> OSS : 上传适配器
+Factory ..> OSS : 上传站点技能包
 OSS ..> OC : 拉取更新
 OC --> WebSys : COOKIE/HEADER
 BP --> WebSys : CDP 操作
@@ -630,12 +632,55 @@ Chrome --> WebSys : debug 账号登录
 - 客户需要自己实现降级逻辑（参考 `office-automation` Skill 的规则）
 - OpenCLI 可通过 Bash 调用或 HTTP daemon（`:19825`）对接
 - 巡检和 CLI 生成同样在客户环境内运行
-- 适配器更新通过 OSS 分发
+- 站点技能包更新通过 OSS 分发
 - 适合有技术能力、已有 Agent 框架的客户
 
-## 八、交付形式
+## 八、交付形式——站点技能包
 
-交付给客户的是一个 **Skill 文件**（`.claude/skills/office-automation.md`），告诉主 Agent 有哪些命令可用、怎么用、什么时候降级：
+交付给客户的是**一组站点技能包 + 一个 Skill 文件**。站点技能包按站点组织，每个包包含该站点自动化所需的全部产物；Skill 文件汇总所有站点的命令清单和降级规则，供主 Agent 决策。
+
+### 8.1 目录结构
+
+```
+# 站点技能包（每站点一个）
+clis/
+├── alimeeting/
+│   ├── rooms.js              # 查询可用会议室
+│   ├── book.js               # 预订会议室
+│   └── my-bookings.js        # 查看我的预订
+├── kingdee/
+│   ├── voucher-list.js
+│   └── ap-aging.js
+└── oa/
+    └── leave-list.js
+
+sitemaps/
+├── alimeeting/
+│   ├── SITE.md               # 站点概述
+│   ├── pages/                # 各页面结构
+│   ├── workflows/            # 操作路径
+│   └── pitfalls.md           # 已知坑
+├── kingdee/
+│   └── ...
+└── oa/
+    └── ...
+
+verify/
+├── alimeeting/
+│   ├── rooms.json            # 回归基准
+│   └── my-bookings.json
+├── kingdee/
+│   └── ...
+└── oa/
+    └── ...
+
+# 跨站点 Skill 文件（一个）
+.claude/skills/office-automation.md
+```
+
+### 8.2 Skill 文件示例
+
+Skill 文件是站点技能包的"索引"——告诉主 Agent 有哪些命令可用、怎么用、什么时候降级：
 
 ```markdown
 # office-automation skill
@@ -662,14 +707,17 @@ Chrome --> WebSys : debug 账号登录
 - `opencli oa leave-list --month 2026-06`
   查询请假记录
 
-## 使用规则
+## 降级规则
 1. 优先使用 opencli 命令（快、稳、无 LLM 成本）
-2. 如果没有对应命令或执行失败，流程清晰时用 waiy-browser-page 分步操作
+2. 如果没有对应命令或执行失败，读取 sitemaps/<site>/ 了解页面结构，
+   用 waiy-browser-page 分步操作
 3. 流程复杂或不确定时，用 waiy-browser-agent 全自主执行
 4. 需要登录时使用已保存的 Cookie（自动注入），LoginFlow 可自动处理登录表单
 ```
 
-这个 Skill 不是一次性写完的——每录制一个新的 CLI 适配器，就在 Skill 里增加对应的命令说明。
+### 8.3 增量更新
+
+站点技能包不是一次性写完的——每录制一个新的 CLI 适配器，对应站点的技能包就多一个文件，Skill 文件里增加一条命令说明。新站点接入时，新建一个站点技能包目录。整个过程由主 Agent 在录制阶段自动完成（提交 Git + 上传 OSS 分发）。
 
 ## 九、客户接入的完整过程
 
@@ -724,14 +772,14 @@ opencli browser verify alimeeting rooms --write-fixture
 # ✅ 写入 ~/.opencli/sites/alimeeting/verify/rooms.json
 ```
 
-**第四步：提交并分发**
+**第四步：提交并分发站点技能包**
 
 主 Agent 在沙箱内提交到本地 Git（版本管理），然后上传到 OSS 供其他镜像拉取。这是 `opencli-adapter-author` skill runbook 的最后一步。
 
 ```bash
-# 主 Agent 提交到本地 Git
-git add clis/alimeeting/
-git commit -m "feat(alimeeting): add room query CLI"
+# 主 Agent 提交站点技能包到本地 Git
+git add clis/alimeeting/ sitemaps/alimeeting/ verify/alimeeting/
+git commit -m "feat(alimeeting): add room query skill package"
 
 # 上传到 OSS（其他镜像从 OSS 拉取更新）
 ```
@@ -847,12 +895,12 @@ done
 
 ### 10.5 推送阶段
 
-适配器在沙箱内录制完成后，主 Agent 提交到本地 Git（版本管理），然后上传到 OSS 分发：
+站点技能包在沙箱内录制完成后，主 Agent 提交到本地 Git（版本管理），然后上传到 OSS 分发：
 
 ```
 沙箱内：Agent git commit → 上传到 OSS
                                 ↓
-其他镜像 ← 启动时或定时从 OSS 拉取最新适配器 + Skill
+其他镜像 ← 启动时或定时从 OSS 拉取最新站点技能包 + Skill 文件
 ```
 
 | 同步时机 | 说明 |
@@ -891,7 +939,7 @@ Chrome 实例
 - 整个录制过程在镜像内完成。Agent 加载 `opencli-adapter-author` skill 后，按 SKILL.md 里的决策树 + runbook 自动执行 `opencli browser *` 命令。研发的角色是发起任务 + review 产出。
 - `opencli browser state` 查看页面元素（带编号），`opencli browser click "[3]"` 精确点击——确定性操作，不依赖 LLM 看截图判断。
 - 总耗时：30 分钟-2 小时/个 API（取决于 API 复杂度和认证方式）。
-- 生成的适配器由主 Agent 提交到本地 Git（版本管理），然后上传到 OSS 供其他镜像拉取。
+- 生成的站点技能包由主 Agent 提交到本地 Git（版本管理），然后上传到 OSS 供其他镜像拉取。
 
 ## 十二、与现有代码的对应关系
 
@@ -910,8 +958,8 @@ Chrome 实例
 | 结构化提取+翻页 | `browser_use/page/extractor.py` → `PageExtractor` | ✅ 已有 |
 | 巡检服务 | 需要新建（定时任务 + shell 脚本） | ❌ 待建 |
 | 登录态管理 | 部分有（OpenCLI Cookie 策略） | 🟡 需扩展 |
-| Skill 推送分发（OSS） | 无 | ❌ 待建 |
-| 客户 Skill 配置 | `.claude/skills/` 框架已有 | 🟡 需定制 |
+| 站点技能包分发（OSS） | 无 | ❌ 待建 |
+| 客户 Skill 文件 | `.claude/skills/` 框架已有 | 🟡 需定制 |
 
 ## 十三、客户接入 checklist
 
@@ -919,10 +967,10 @@ Chrome 实例
 |------|------|------|------|
 | 1. 获取 debug 账号 | 1 天 | 账号密码 + 系统 URL 清单 | 客户 |
 | 2. 镜像内 Chrome 登录 | 1 小时 | 各系统登录态就绪 | 研发 |
-| 3. 逐系统生成 CLI | 1-2 天/系统 | `clis/<site>/*.js` 适配器 | OpenClaw + 研发 review |
+| 3. 逐系统生成站点技能包 | 1-2 天/系统 | `clis/` + `sitemaps/` + `verify/` | OpenClaw + 研发 review |
 | 4. 验证全部 CLI | 半天 | `opencli validate` + 实际执行全部通过 | 研发 |
-| 5. 编写客户 Skill | 2 小时 | `.claude/skills/office-automation.md` | 研发 |
-| 6. 部署镜像 | 半天 | OpenCLI + Skill 在镜像环境跑通 | 研发 + 客户 IT |
+| 5. 编写 Skill 文件 | 2 小时 | `.claude/skills/office-automation.md` | 研发 |
+| 6. 部署镜像 | 半天 | 站点技能包 + Skill 在镜像环境跑通 | 研发 + 客户 IT |
 | 7. 配置巡检 | 1 小时 | 定时任务 | 研发 |
 | **总计** | **4-6 天** | 可用的数字员工 | |
 
