@@ -454,13 +454,15 @@ OpenCLI 比 waiy-browser-page 快一个数量级，比 waiy-browser-agent 快两
 
 ## 七、整体架构
 
-主 Agent 接收用户指令，优先用 OpenCLI 执行（快、稳、无 LLM 成本），不行就降级到 waiy-browser-page（LLM 辅助按步操作），最后兜底用 waiy-browser-agent（全自主）。云侧有个服务负责生成和维护 CLI 适配器。
+主 Agent 接收用户指令，优先用 OpenCLI 执行（快、稳、无 LLM 成本），不行就降级到 waiy-browser-page（LLM 辅助按步操作），最后兜底用 waiy-browser-agent（全自主）。
 
-实际部署有两种模式：客户使用镜像环境中预装的主 Agent，或客户使用自有 Agent 对接 OpenCLI。
+**除主 Agent 外的所有组件（OpenCLI、waiy-browser、巡检服务、CLI 生成能力、Chrome 实例）都打包在镜像中交付给客户**，自包含运行。云侧只保留 Skill 仓库（Git）用于版本管理和多客户分发。
+
+实际部署有两种模式：客户使用镜像环境中预装的主 Agent，或客户使用自有 Agent 对接。
 
 ### 7.1 模式 A：镜像环境部署（更常见）
 
-客户使用我们提供的镜像环境，主 Agent、OpenCLI、waiy-browser 全部预装在镜像中，开箱即用。
+客户使用我们提供的镜像环境，主 Agent + 全部工具链 + 巡检 + CLI 生成能力全部预装，开箱即用。
 
 ```plantuml
 @startuml
@@ -471,70 +473,6 @@ actor "客户用户" as User
 
 package "镜像环境（4C8G 沙箱）" {
   [主 Agent\n(OpenClaw，预装)] as CC
-  [OpenCLI\n(Node 运行时，预装)] as OC
-
-  package "waiy-browser 技能栈（预装）" {
-    [waiy-browser-page\n(中层：LLM 辅助)] as BP
-    [waiy-browser-agent\n(高层：全自主)] as BA
-    [waiy-browser\n(底层：执行基座)] as BW
-
-    BP --> BW : 内部调用
-    BA --> BW : 内部调用
-  }
-
-  [office-automation Skill\n(.claude/skills/)] as Skill
-
-  CC --> Skill : 读取可用命令
-  CC --> OC : 优先调用\n(0.5-10s)
-  CC --> BP : 降级 1：分步操作\n(10-40s)
-  CC --> BA : 降级 2：复杂任务\n(30-180s)
-}
-
-package "云侧（维护）" {
-  [CLI 生成服务\n(OpenClaw\n+ opencli browser *)] as Factory
-  [巡检服务\n(定时任务 + validate)] as Patrol
-  database "Skill 仓库\n(Git)" as Repo
-  [Chrome\n(debug 账号)] as Chrome
-
-  Factory --> Chrome : CDP
-  Patrol --> Chrome : CDP
-  Factory --> Repo : 发布新 CLI
-  Patrol --> Factory : 失效→修复
-}
-
-cloud "客户 Web 系统" {
-  [OA/ERP/企微...] as WebSys
-}
-
-User --> CC : "帮我查明天的会议室"
-Repo --> OC : 推送 CLI 更新\n+ Skill 更新
-OC --> WebSys : COOKIE/HEADER
-BP --> WebSys : CDP 操作
-BA --> WebSys : CDP 操作
-Chrome --> WebSys : debug 账号登录
-
-@enduml
-```
-
-**特点**：
-- 客户不需要自己搭环境，镜像里全部就绪
-- OpenCLI 适配器和 Skill 通过 Git 推送到镜像中更新
-- 主 Agent 预配置好 `office-automation` Skill
-- 适合大部分客户场景
-
-### 7.2 模式 B：客户自有 Agent 对接
-
-客户已有自己的 Agent 框架（或使用其他 LLM Agent），通过调用 OpenCLI 命令和 waiy-browser 技能栈对接。
-
-```plantuml
-@startuml
-skinparam componentStyle rectangle
-skinparam backgroundColor #FEFEFE
-
-actor "客户用户" as User
-
-package "客户侧" {
-  [客户自有 Agent] as CA
   [OpenCLI\n(Node 运行时)] as OC
 
   package "waiy-browser 技能栈" {
@@ -546,29 +484,33 @@ package "客户侧" {
     BA --> BW : 内部调用
   }
 
-  CA --> OC : 调用 opencli 命令\n(Bash / HTTP API)
-  CA --> BP : 降级 1
-  CA --> BA : 降级 2
+  package "生成与维护" {
+    [CLI 生成\n(opencli-adapter-author\n+ opencli browser *)] as Factory
+    [巡检服务\n(定时任务 + validate\n+ opencli-autofix)] as Patrol
+    [Chrome 实例\n(debug 账号)] as Chrome
+
+    Factory --> Chrome : CDP
+    Patrol --> Chrome : CDP
+    Patrol --> Factory : 失效→修复
+  }
+
+  [Skill 文件\n(.claude/skills/)] as Skill
+
+  CC --> Skill : 读取可用命令
+  CC --> OC : 优先调用\n(0.5-10s)
+  CC --> BP : 降级 1\n(10-40s)
+  CC --> BA : 降级 2\n(30-180s)
+  Factory --> OC : 生成适配器
 }
 
-package "云侧（维护）" {
-  [CLI 生成服务] as Factory
-  [巡检服务] as Patrol
-  database "Skill 仓库" as Repo
-  [Chrome] as Chrome
-
-  Factory --> Chrome : CDP
-  Patrol --> Chrome : CDP
-  Factory --> Repo : 发布新 CLI
-  Patrol --> Factory : 失效→修复
-}
+database "Skill 仓库\n(Git，云侧)" as Repo
 
 cloud "客户 Web 系统" {
   [OA/ERP/企微...] as WebSys
 }
 
-User --> CA : 自然语言指令
-Repo --> OC : 推送 CLI 更新
+User --> CC : "帮我查明天的会议室"
+Repo --> Skill : 版本同步\n+ 多客户分发
 OC --> WebSys : COOKIE/HEADER
 BP --> WebSys : CDP 操作
 BA --> WebSys : CDP 操作
@@ -578,9 +520,77 @@ Chrome --> WebSys : debug 账号登录
 ```
 
 **特点**：
-- 客户自己维护 Agent，我们只提供 OpenCLI + waiy-browser 作为工具层
+- 客户不需要自己搭环境，镜像里全部就绪（包括 CLI 生成和巡检能力）
+- 镜像内的 Chrome 实例维护 debug 账号登录态，巡检定时任务自动运行
+- 新增 CLI 适配器可以在镜像内完成录制、验证、发布全流程
+- Skill 仓库（Git）是唯一的云侧组件，用于版本管理和多客户分发
+- 适合大部分客户场景
+
+### 7.2 模式 B：客户自有 Agent 对接
+
+客户已有自己的 Agent 框架（或使用其他 LLM Agent），我们提供除主 Agent 外的全部组件。
+
+```plantuml
+@startuml
+skinparam componentStyle rectangle
+skinparam backgroundColor #FEFEFE
+
+actor "客户用户" as User
+
+package "客户环境" {
+  [客户自有 Agent] as CA
+
+  package "我们提供的工具层" {
+    [OpenCLI\n(Node 运行时)] as OC
+
+    package "waiy-browser 技能栈" {
+      [waiy-browser-page\n(中层)] as BP
+      [waiy-browser-agent\n(高层)] as BA
+      [waiy-browser\n(底层)] as BW
+
+      BP --> BW : 内部调用
+      BA --> BW : 内部调用
+    }
+
+    package "生成与维护" {
+      [CLI 生成] as Factory
+      [巡检服务] as Patrol
+      [Chrome 实例] as Chrome
+
+      Factory --> Chrome : CDP
+      Patrol --> Chrome : CDP
+      Patrol --> Factory : 失效→修复
+    }
+
+    Factory --> OC : 生成适配器
+  }
+
+  CA --> OC : 调用 opencli 命令\n(Bash / HTTP API)
+  CA --> BP : 降级 1
+  CA --> BA : 降级 2
+}
+
+database "Skill 仓库\n(Git，云侧)" as Repo
+
+cloud "客户 Web 系统" {
+  [OA/ERP/企微...] as WebSys
+}
+
+User --> CA : 自然语言指令
+Repo --> OC : 版本同步
+OC --> WebSys : COOKIE/HEADER
+BP --> WebSys : CDP 操作
+BA --> WebSys : CDP 操作
+Chrome --> WebSys : debug 账号登录
+
+@enduml
+```
+
+**特点**：
+- 客户自己维护 Agent，我们提供 OpenCLI + waiy-browser + 巡检 + CLI 生成能力作为工具层
 - 客户需要自己实现降级逻辑（参考 `office-automation` Skill 的规则）
 - OpenCLI 可通过 Bash 调用或 HTTP daemon（`:19825`）对接
+- 巡检和 CLI 生成同样在客户环境内运行，不依赖云侧
 - 适合有技术能力、已有 Agent 框架的客户
 
 ## 八、交付形式
@@ -800,17 +810,21 @@ done
 
 ### 10.5 推送阶段
 
+适配器和 Skill 更新需要从 Skill 仓库同步到客户镜像：
+
 | 方式 | 适用场景 | 客户体验 |
 |------|---------|---------|
-| Git pull | 客户有 Node 环境 | `opencli plugin update` 一键更新 |
+| Git pull | 镜像内直接拉取 | `opencli plugin update` 一键更新 |
+| OSS 分发（阿里云） | 多客户统一管理 | 镜像启动时自动拉取最新版本 |
 | 文件同步（rsync/scp） | 简单直接 | 运维操作，用户无感 |
-| 包分发（npm private registry） | 多客户统一管理 | `npm update @customer/opencli-skills` |
 
-## 十一、云侧 CLI 生成服务
+## 十一、镜像内的生成与维护服务
+
+CLI 生成和巡检服务都运行在客户镜像内，不依赖云侧。
 
 ### 11.1 Chrome 实例与 debug 账号
 
-客户给一个 debug 账号，云侧维护一个 Chrome 实例：
+客户给一个 debug 账号，镜像内维护一个 Chrome 实例：
 
 ```
 Chrome 实例
@@ -831,9 +845,10 @@ Chrome 实例
 
 ### 11.2 生成流程补充
 
-- 整个录制过程是 AI Agent 操作，不是人手动点。Agent 加载 `opencli-adapter-author` skill 后，按 SKILL.md 里的决策树 + runbook 自动执行 `opencli browser *` 命令。研发的角色是发起任务 + review 产出。
+- 整个录制过程在镜像内完成。Agent 加载 `opencli-adapter-author` skill 后，按 SKILL.md 里的决策树 + runbook 自动执行 `opencli browser *` 命令。研发的角色是发起任务 + review 产出。
 - `opencli browser state` 查看页面元素（带编号），`opencli browser click "[3]"` 精确点击——确定性操作，不依赖 LLM 看截图判断。
 - 总耗时：30 分钟-2 小时/个 API（取决于 API 复杂度和认证方式）。
+- 生成的适配器提交到 Skill 仓库（Git），通过 OSS 或 Git pull 同步到其他客户镜像。
 
 ## 十二、与现有代码的对应关系
 
@@ -860,11 +875,11 @@ Chrome 实例
 | 步骤 | 耗时 | 产出 | 谁做 |
 |------|------|------|------|
 | 1. 获取 debug 账号 | 1 天 | 账号密码 + 系统 URL 清单 | 客户 |
-| 2. 云侧 Chrome 登录 | 1 小时 | 各系统登录态就绪 | 研发 |
+| 2. 镜像内 Chrome 登录 | 1 小时 | 各系统登录态就绪 | 研发 |
 | 3. 逐系统生成 CLI | 1-2 天/系统 | `clis/<site>/*.js` 适配器 | OpenClaw + 研发 review |
 | 4. 验证全部 CLI | 半天 | `opencli validate` + 实际执行全部通过 | 研发 |
 | 5. 编写客户 Skill | 2 小时 | `.claude/skills/office-automation.md` | 研发 |
-| 6. 部署到客户端 | 半天 | OpenCLI + Skill 在客户环境跑通 | 研发 + 客户 IT |
+| 6. 部署镜像 | 半天 | OpenCLI + Skill 在镜像环境跑通 | 研发 + 客户 IT |
 | 7. 配置巡检 | 1 小时 | 定时任务 | 研发 |
 | **总计** | **4-6 天** | 可用的数字员工 | |
 
